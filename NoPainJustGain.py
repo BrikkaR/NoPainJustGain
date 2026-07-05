@@ -155,11 +155,11 @@ if st.button("Lancer l'Analyse Symbiotique", type="primary"):
             
             # Formatage du tableau
             st.dataframe(
-                df.style.format("{:.2f} €").applymap(
-                    lambda x: 'color: green' if x > 0 else 'color: red' if x < 0 else '', 
-                    subset=['Écart (CDII - CTT)']
-                ),
-                use_container_width=True
+            df.style.format("{:.2f} €").map(
+                lambda x: 'color: green' if x > 0 else 'color: red' if x < 0 else '', 
+                subset=['Écart (CDII - CTT)']
+            ),
+            use_container_width=True
             )
             
             # Zone d'aide à la décision
