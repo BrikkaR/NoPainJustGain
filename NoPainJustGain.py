@@ -26,9 +26,9 @@ MOIS_LABELS = {
 # ==========================================
 # 2. OUTILS DE PARSING GÉNÉRIQUES
 # ==========================================
-# Nombre au format FR : 1 234,56 / 1234,56 / 3 170,108 (2 à 3 décimales ; les colonnes
-# IFM/CP des bulletins affichent 3 décimales, ce qui casserait un parsing figé à 2 décimales).
-_MONTANT_FR = r"\d{1,3}(?:[ \u00a0\u202f.]\d{3})*,\d{2,3}|\d+,\d{2,3}"
+# Nombre au format FR, signe négatif optionnel (lignes de régularisation) et
+# 2 à 3 décimales (colonnes IFM/CP des bulletins affichent 3 décimales).
+_MONTANT_FR = r"-?\d{1,3}(?:[ \u00a0\u202f.]\d{3})*,\d{2,3}|-?\d+,\d{2,3}"
 
 def parse_montant_fr(s):
     """Convertit un montant FR ('3 170,11' / '3.170,11' / '2393,78') en float."""
@@ -55,6 +55,13 @@ def _tous_les_montants(ligne):
 _RE_NOM = re.compile(r"^([A-ZÀ-Ÿ][A-ZÀ-Ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+)+?)\s*\(", re.UNICODE)
 # Toutes les dates jj/mm (avec éventuellement /aa ou /aaaa)
 _RE_DATES = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/\d{2,4})?\b")
+# Rubriques NON soumises à cotisations (remboursements de frais -> refacturés au coef 1,00)
+_RE_NON_SOUMISE = re.compile(r"PANIER|TICKET|RESTAUR|TRANSPORT|REMBOURS|D[ÉE]PLACEMENT|KILOM", re.I)
+
+def _libelle_facture(ligne):
+    """Libellé d'une ligne de facture : texte entre la parenthèse de date et le 1er nombre."""
+    m = re.search(r"\)\s*(.+?)\s+-?\d", ligne)
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
 
 def mois_de_la_ligne(ligne):
     """
@@ -69,8 +76,12 @@ def mois_de_la_ligne(ligne):
     return mois_trouves[-1], mois_trouves
 
 def est_ligne_prestation(ligne):
-    """Ligne de prestation = contient au moins une date (et souvent un repère 'Sem.')."""
-    return bool(_RE_DATES.search(ligne))
+    """
+    Ligne de prestation BESTT = repère de semaine 'Sem.NN' + au moins une date.
+    Le repère 'Sem' est requis pour exclure les en-têtes/pieds de page répétés
+    (ex. « Période du 01/05/2026 au 21/06/2026 ») qui contiennent aussi des dates.
+    """
+    return bool(re.search(r"sem\.?\s*\d", ligne, re.IGNORECASE)) and bool(_RE_DATES.search(ligne))
 
 def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
     """Parse les lignes d'une page de facture et alimente `consolidation` (dict mutable)."""
@@ -89,14 +100,38 @@ def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
             mois_attr, mois_trouves = mois_de_la_ligne(ligne)
             if mois_attr is None:
                 continue
-            retenue = (mois_attr == mois_cible)
+            # Seules les lignes avec un total facturé « = … € » sont facturées.
+            # Les lignes sans « = » (prime de référence, journée de solidarité non
+            # facturée) affichent un taux mais aucun montant -> à ne PAS sommer,
+            # sinon le total diverge du total imprimé sur la facture.
+            a_total = "=" in ligne
             montants = _tous_les_montants(ligne)
-            montant = montants[-1] if montants else 0.0
-            statut = "✅ RETENUE" if retenue else f"⏭️ ignorée (mois {mois_attr})"
+            montant = montants[-1] if (a_total and montants) else 0.0
+            retenue = (mois_attr == mois_cible) and a_total
+
+            # Métadonnées pour le contrôle des coefficients de facturation
+            libelle = _libelle_facture(ligne)
+            qte = montants[0] if montants else None
+            # taux facturé unitaire = montant / qté (robuste), sinon 2e nombre de la ligne
+            if qte not in (None, 0) and a_total:
+                taux_fact = round(montant / qte, 4)
+            elif len(montants) >= 3:
+                taux_fact = montants[1]
+            else:
+                taux_fact = None
+            soumise = not bool(_RE_NON_SOUMISE.search(libelle))
+
+            if not a_total:
+                statut = "ℹ️ non facturée (sans total « = »)"
+            elif retenue:
+                statut = "✅ RETENUE"
+            else:
+                statut = f"⏭️ ignorée (mois {mois_attr})"
             consolidation[interimaire]["historique_lignes"].append({
                 "fichier": nom_fichier, "ligne": ligne.strip(),
                 "mois_attribution": mois_attr, "mois_trouves": mois_trouves,
                 "montant": montant, "retenue": retenue, "statut": statut,
+                "libelle": libelle, "qte": qte, "taux_fact": taux_fact, "soumise": soumise,
             })
             if retenue:
                 consolidation[interimaire]["total"] += montant
@@ -104,14 +139,19 @@ def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
 def lire_factures_bestt_consolidees(fichiers_factures, mois_cible="05"):
     consolidation = {}
     for fichier in fichiers_factures:
+        # On concatène TOUTES les pages avant de parser : ainsi l'en-tête intérimaire
+        # persiste quand ses lignes se poursuivent d'une page à l'autre (ex. SIMION,
+        # dont le bloc s'étale sur 2 pages de la facture 369).
+        texte_complet = ""
         with pdfplumber.open(fichier) as pdf:
             for page in pdf.pages:
-                texte = page.extract_text() or ""
-                parser_lignes_facture(texte.split("\n"), fichier.name, mois_cible, consolidation)
+                texte_complet += (page.extract_text() or "") + "\n"
+        parser_lignes_facture(texte_complet.split("\n"), fichier.name, mois_cible, consolidation)
 
     donnees = []
     for nom, data in consolidation.items():
-        if data["total"] > 0:
+        nb_retenues = sum(1 for l in data["historique_lignes"] if l["retenue"])
+        if nb_retenues > 0:   # au moins une ligne du mois cible (même si total net = 0 -> anomalie)
             donnees.append({
                 "interimaire": nom,
                 "total_facture": round(data["total"], 2),
@@ -250,48 +290,98 @@ def extraire_heures(texte, rows=None, defaut=151.67):
                         return val
     return defaut
 
+def extraire_taux_bs(texte):
+    """
+    Extrait les taux de référence du bulletin pour le contrôle des coefficients :
+    - taux horaire PAYÉ par type d'heure (bloc soumis à cotisations) ;
+    - coût unitaire du panier / ticket resto (bloc non soumis).
+    Retourne (dict {libellé -> taux}, cout_panier).
+    """
+    lignes = texte.split("\n")
+
+    def taux_heure(label):
+        # ligne type : "1 HEURES NORMALES 126,95h 12,0900 1 534,826 ..."
+        # -> taux = nombre placé juste après "<qté>h"
+        for l in lignes:
+            if re.search(label, l, re.IGNORECASE):
+                m = re.search(r",\d+\s*h\s+(\d[\d\u00a0 ]*,\d{2,4})", l)
+                if m:
+                    return parse_montant_fr(m.group(1))
+        return None
+
+    taux = {
+        "HEURES NORMALES": taux_heure(r"HEURES\s+NORMALES"),
+        "HEURES DIMANCHE": taux_heure(r"HEURES\s+DIMANCHE"),
+    }
+
+    cout_panier = None
+    for l in lignes:
+        if re.search(r"PANIER|TICKET|RESTAUR", l, re.IGNORECASE):
+            nums = re.findall(_MONTANT_FR, l)
+            if len(nums) >= 2:                      # qté, taux, montant -> taux = 2e
+                cout_panier = parse_montant_fr(nums[1])
+                break
+    return taux, cout_panier
+
 def _lire_bs(fichiers_bs):
-    """Lit chaque BS : texte (pour l'association nom) + mots positionnés (pour le brut)."""
+    """
+    Lit chaque BS en traitant CHAQUE PAGE comme un bulletin distinct
+    (un PDF de paie contient souvent tous les bulletins du mois, un par page).
+    Retourne une liste de documents-pages : texte (pour l'association nom) +
+    mots positionnés (pour l'extraction du brut par coordonnées).
+    """
     docs = []
     for f in fichiers_bs:
-        texte, mots = "", []
         with pdfplumber.open(f) as pdf:
+            n = len(pdf.pages)
             for i, p in enumerate(pdf.pages):
-                texte += (p.extract_text() or "") + "\n"
-                for w in (p.extract_words() or []):
-                    # décalage vertical par page pour ne pas fusionner des lignes de pages différentes
-                    mots.append({"text": w["text"], "x0": w["x0"], "x1": w["x1"],
-                                 "top": w["top"] + i * 100000, "bottom": w["bottom"] + i * 100000})
-        docs.append({"name": f.name, "texte": texte, "mots": mots})
+                texte = p.extract_text() or ""
+                mots = [{"text": w["text"], "x0": w["x0"], "x1": w["x1"],
+                         "top": w["top"], "bottom": w["bottom"]}
+                        for w in (p.extract_words() or [])]
+                label = f.name if n == 1 else f"{f.name} · p.{i + 1}"
+                docs.append({"name": label, "texte": texte, "mots": mots})
     return docs
 
+def _trouver_page_bs(docs, nom_facture):
+    """
+    Rattache un intérimaire à SA page de bulletin.
+    Match STRICT : NOM de famille + TOUS les prénoms présents sur la page.
+    En cas de 0 ou plusieurs correspondances (homonymes type TEISANU Marin /
+    TEISANU Gabriel), on NE DEVINE PAS -> None (sera signalé, saisie manuelle).
+    """
+    mots_nom = nom_facture.split()
+    nom_famille = mots_nom[0]
+    prenoms = mots_nom[1:]
+
+    correspondances = []
+    for d in docs:
+        t = d["texte"]
+        if nom_famille not in t:
+            continue
+        if prenoms and not all(pr in t for pr in prenoms):
+            continue
+        correspondances.append(d)
+
+    if len(correspondances) == 1:
+        return correspondances[0], "ok"
+    if len(correspondances) == 0:
+        return None, "introuvable"
+    return None, "ambigu"
+
 def extraire_et_associer_bs(fichiers_bs, factures_data):
-    """Associe les données de paie exactes aux factures consolidées."""
+    """Associe les données de paie exactes aux factures consolidées (page par page)."""
     docs = _lire_bs(fichiers_bs)
 
     resultats = []
     for fact in factures_data:
-        nom_facture = fact["interimaire"]
-        mots_nom = nom_facture.split()
-        nom_famille = mots_nom[0]           # NOM (souvent en majuscules, distinctif)
-        prenom = mots_nom[-1] if len(mots_nom) > 1 else ""
-
-        doc_cible = None
-        # 1) match strict NOM + Prénom, 2) fallback sur le NOM seul
-        for d in docs:
-            if nom_famille in d["texte"] and (not prenom or prenom in d["texte"]):
-                doc_cible = d
-                break
-        if doc_cible is None:
-            for d in docs:
-                if nom_famille in d["texte"]:
-                    doc_cible = d
-                    break
+        doc_cible, statut_match = _trouver_page_bs(docs, fact["interimaire"])
 
         if doc_cible:
             sb, base, methode_brut, ligne_brut, rows_diag = extraire_brut(
                 doc_cible["texte"], doc_cible["mots"])
             heures = extraire_heures(doc_cible["texte"], rows_diag)
+            taux_bs, cout_panier = extraire_taux_bs(doc_cible["texte"])
             trouve = sb is not None
             bs_data = {
                 "brut_sb": sb if trouve else 0.0,          # brut social affiché (inclut IFM/CP)
@@ -302,6 +392,8 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "fichier_bs": doc_cible["name"], "label_brut": methode_brut,
                 "ligne_brut": ligne_brut,
                 "lignes_diag": rows_diag,                  # pour le panneau diagnostic
+                "statut_match": statut_match,
+                "taux_bs": taux_bs, "cout_panier": cout_panier,
             }
         else:
             bs_data = {
@@ -310,6 +402,8 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "primes_non_soumises": 0.0,
                 "fichier_bs": None, "label_brut": None,
                 "ligne_brut": None, "lignes_diag": [],
+                "statut_match": statut_match,   # "introuvable" ou "ambigu"
+                "taux_bs": {}, "cout_panier": None,
             }
         resultats.append({"facture": fact, "bs": bs_data})
     return resultats
@@ -404,6 +498,92 @@ def recommander_statut(marges):
                       f"{delta_integration:+.2f} € de marge tant que la mission n'est pas terminée.")
     return best, delta_integration, signal_ifm
 
+def controle_coefficients(dossier, tolerance=0.02):
+    """
+    Contrôle de gestion des coefficients de facturation :
+    - les charges SOUMISES (heures) doivent être facturées au coefficient commercial ;
+    - les charges NON SOUMISES (panier repas / ticket resto) doivent être refacturées
+      au coefficient 1,00 (remboursement de frais à l'euro près).
+    Renvoie un dict avec le coef commercial détecté, l'analyse des lignes non soumises
+    et les alertes explicitées.
+    """
+    lignes = [l for l in dossier["facture"]["lignes_retenues"] if l.get("retenue")]
+    bs = dossier["bs"]
+    taux_bs = bs.get("taux_bs") or {}
+    cout_panier = bs.get("cout_panier")
+
+    def taux_facture_pour(motif):
+        # Taux facturé DOMINANT (mode) parmi les lignes du type visé.
+        # On prend le mode et non la moyenne pour ignorer les lignes de régularisation
+        # (ex. heures normales reclassées en jour férié à 33,40 / 52,67 €).
+        vals = [round(l["taux_fact"], 2) for l in lignes
+                if l.get("taux_fact") and l["taux_fact"] > 0
+                and re.search(motif, l.get("libelle", ""), re.IGNORECASE)]
+        if not vals:
+            return None
+        freq = {}
+        for v in vals:
+            freq[v] = freq.get(v, 0) + 1
+        return max(freq, key=freq.get)   # valeur la plus fréquente
+
+    # --- Coefficient commercial (sur les heures) : HN sinon DIMANCHE ---
+    coef_commercial, base_type, tf_com, tp_com = None, None, None, None
+    for typ, motif in [("HEURES NORMALES", r"HEURES\s+NORMALES"),
+                       ("HEURES DIMANCHE", r"HEURES\s+DIMANCHE")]:
+        tf = taux_facture_pour(motif)
+        tp = taux_bs.get(typ)
+        if tf and tp:
+            coef_commercial = round(tf / tp, 3)
+            base_type, tf_com, tp_com = typ, tf, tp
+            break
+
+    # --- Lignes NON soumises : coefficient attendu = 1,00 ---
+    lignes_ns = [l for l in lignes if not l.get("soumise")]
+    analyse_ns = []
+    ecart_total = 0.0
+    for l in lignes_ns:
+        tf = l.get("taux_fact")
+        cout = cout_panier
+        coef = round(tf / cout, 3) if (tf and cout) else None
+        qte = l.get("qte") or 0
+        ecart = (tf - cout) * qte if (tf is not None and cout is not None) else 0.0
+        ecart_total += ecart
+        analyse_ns.append({"libelle": l.get("libelle"), "taux_fact": tf,
+                           "cout": cout, "coef": coef, "qte": qte, "ecart": round(ecart, 2)})
+
+    # --- Alertes ---
+    alertes = []
+    ns_hors_norme = [a for a in analyse_ns if a["coef"] is not None and abs(a["coef"] - 1.0) > tolerance]
+    if ns_hors_norme:
+        sens = "surfacturé au client" if ecart_total > 0 else "sous-facturé (perte agence)"
+        alertes.append(
+            f"Écart sur charges NON soumises : {round(ecart_total, 2):+.2f} € ({sens}). "
+            "Une indemnité de panier / ticket resto est un remboursement de frais : elle doit "
+            "être refacturée au coefficient 1,00 (à l'euro près). Un coefficient ≠ 1,00 signifie "
+            "que le coefficient commercial a été appliqué à tort à une charge non soumise.")
+
+    # Cohérence du coefficient commercial entre types d'heures (facultatif)
+    coefs_heures = []
+    for typ, motif in [("HEURES NORMALES", r"HEURES\s+NORMALES"),
+                       ("HEURES DIMANCHE", r"HEURES\s+DIMANCHE")]:
+        tf = taux_facture_pour(motif)
+        tp = taux_bs.get(typ)
+        if tf and tp:
+            coefs_heures.append(round(tf / tp, 3))
+    if len(coefs_heures) >= 2 and (max(coefs_heures) - min(coefs_heures)) > 0.05:
+        alertes.append(
+            f"Coefficient commercial incohérent entre types d'heures ({coefs_heures}) : "
+            "les heures soumises devraient toutes être facturées au même coefficient.")
+
+    return {
+        "coef_commercial": coef_commercial,
+        "base_type": base_type, "taux_fact_com": tf_com, "taux_paye_com": tp_com,
+        "cout_panier": cout_panier,
+        "analyse_ns": analyse_ns,
+        "ecart_ns_total": round(ecart_total, 2),
+        "alertes": alertes,
+    }
+
 # ==========================================
 # 6. INTERFACE UTILISATEUR
 # ==========================================
@@ -481,8 +661,16 @@ if "dossiers_audit" in st.session_state:
 
         c_nom, c_src, c_val = st.columns([2, 3, 2])
         c_nom.markdown(f"**{nom}**")
-        if not trouve:
-            c_src.caption(f"BS : {fichier} · 🔴 **SB introuvable** — à saisir à droite")
+        statut_match = bs.get("statut_match")
+        if statut_match == "ambigu":
+            c_src.caption("🟠 **Homonymes** : plusieurs bulletins correspondent au nom "
+                          "→ rattachement impossible sans risque. Saisir le SB à droite.")
+        elif not trouve:
+            if statut_match == "introuvable":
+                c_src.caption("🔴 **Aucun bulletin** pour cet intérimaire (facturé sans BS ?) "
+                              "— saisir le SB à droite.")
+            else:
+                c_src.caption(f"BS : {fichier} · 🔴 **SB introuvable** — à saisir à droite")
         elif auto_sb == 0.0:
             c_src.caption(f"BS : {fichier} · ⚠️ SB détecté = 0,00 € (anomalie de paie)")
         else:
@@ -529,6 +717,9 @@ if "dossiers_audit" in st.session_state:
                          "total_brut": sb / RATIO_SB_BASE}}  # base soumise = SB / 1,21
         master_results.append(calculer_comparatif(d_calc, is_pacte, taux_smic))
 
+    # Contrôle des coefficients de facturation (soumises vs non soumises), par intérimaire
+    controles_coef = {d["facture"]["interimaire"]: controle_coefficients(d) for d in dossiers}
+
     # ----------------------------------------------------------
     # SYNTHÈSE GRAPHIQUE : choix de contrat & intégration IFM/CP
     # ----------------------------------------------------------
@@ -572,6 +763,17 @@ if "dossiers_audit" in st.session_state:
     st.caption("💡 « Δ Mensualisation » = marge CTT Mensualisé − marge CTT Provision. "
                "Positif → intégrer les IFM/CP en cours de mois est gagnant ; "
                "négatif → mieux vaut les laisser en séquestre tant que la mission n'est pas soldée.")
+
+    # Synthèse des anomalies de coefficient de facturation
+    anomalies_coef = [(nom, c) for nom, c in controles_coef.items() if c["alertes"]]
+    if anomalies_coef:
+        st.error(f"⚠️ Anomalies de coefficient de facturation détectées sur "
+                 f"{len(anomalies_coef)} intérimaire(s) : "
+                 + ", ".join(nom for nom, _ in anomalies_coef)
+                 + ". Détail dans chaque dossier ci-dessous.")
+    else:
+        st.success("✅ Contrôle des coefficients : heures soumises au coefficient commercial, "
+                   "charges non soumises (panier / ticket resto) refacturées à 1,00. Aucun écart.")
 
     # ----------------------------------------------------------
     # VUE DÉTAILLÉE PAR SALARIÉ
@@ -628,6 +830,36 @@ if "dossiers_audit" in st.session_state:
                 else:
                     st.success(f"✅ Coefficient commercial validé : {r['Coef']}")
                 st.info(signal)
+
+            # --- CONTRÔLE DES COEFFICIENTS DE FACTURATION ---
+            ctrl = controles_coef.get(r["Interimaire"])
+            if ctrl:
+                cc = ctrl["coef_commercial"]
+                if cc is not None:
+                    st.markdown(
+                        f"**Contrôle des coefficients** — commercial détecté sur les heures "
+                        f"soumises : **{cc:.2f}** "
+                        f"({ctrl['taux_fact_com']:.2f} € facturé / {ctrl['taux_paye_com']:.2f} € payé, "
+                        f"{ctrl['base_type']})")
+                # Récap des lignes non soumises (attendu : coef 1,00)
+                if ctrl["analyse_ns"]:
+                    lignes_txt = []
+                    for a in ctrl["analyse_ns"]:
+                        if a["coef"] is None:
+                            continue
+                        icone = "✅" if abs(a["coef"] - 1.0) <= 0.02 else "⚠️"
+                        lignes_txt.append(
+                            f"{icone} {a['libelle']} : facturé {a['taux_fact']:.2f} € / "
+                            f"coût {a['cout']:.2f} € → coef {a['coef']:.2f}")
+                    if lignes_txt:
+                        st.caption("Charges non soumises (remboursements, attendu coef 1,00) : "
+                                   + " · ".join(lignes_txt))
+                if ctrl["alertes"]:
+                    for al in ctrl["alertes"]:
+                        st.error("⚠️ " + al)
+                elif cc is not None:
+                    st.success("✅ Coefficients conformes : heures au coef commercial, "
+                               "charges non soumises (panier/ticket resto) refacturées à 1,00.")
 
             # --- AFFICHAGE OPTIONNEL DES LIGNES DE FACTURE (déployé au clic) ---
             lignes = r["LignesRetenues"]
