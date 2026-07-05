@@ -291,6 +291,21 @@ def extraire_heures(texte, rows=None, defaut=151.67):
                         return val
     return defaut
 
+def extraire_heures_supp(texte):
+    """
+    Somme des HEURES SUPPLÉMENTAIRES (lignes 'HEURES SUPP …' du bloc soumis).
+    Sert à la proratisation RGDU : SMIC_ref sur (heures normales) + (heures supp × 1,25),
+    et à la déduction TEPA (sur les heures supp uniquement).
+    On lit la quantité (nombre suivi de 'h'), pas le taux ni le montant.
+    """
+    total = 0.0
+    for l in texte.split("\n"):
+        if re.search(r"HEURES\s+SUPP", l, re.IGNORECASE):
+            m = re.search(r"([\d\u00a0 ]+,\d+)\s*h", l)   # qté avant le 'h'
+            if m:
+                total += parse_montant_fr(m.group(1))
+    return round(total, 2)
+
 def _norm_libelle(s):
     """Normalise un libellé de rubrique pour rapprocher facture et BS."""
     s = re.sub(r"^\s*\d+\s*", "", s)              # retire le marqueur de ligne (1, 7, 2…)
@@ -411,15 +426,19 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
         if doc_cible:
             sb, base, methode_brut, ligne_brut, rows_diag = extraire_brut(
                 doc_cible["texte"], doc_cible["mots"])
-            heures = extraire_heures(doc_cible["texte"], rows_diag)
+            heures_total = extraire_heures(doc_cible["texte"], rows_diag)
+            heures_supp = extraire_heures_supp(doc_cible["texte"])
+            heures_normales = max(0.0, round(heures_total - heures_supp, 2))
             taux_bs, taux_variables, cout_panier = extraire_taux_bs(doc_cible["texte"])
             trouve = sb is not None
             bs_data = {
                 "brut_sb": sb if trouve else 0.0,          # brut social affiché (inclut IFM/CP)
                 "total_brut": base if trouve else 0.0,     # base soumise (= SB/1,21) pour le calcul
                 "brut_trouve": trouve,                     # distingue "introuvable" de "= 0,00"
-                "heures_normales": heures,
-                "heures_sup": 0.0, "heures_autres": 0.0, "primes_non_soumises": 0.0,
+                "heures_normales": heures_normales,        # normales + nuit/dimanche + JF + solidarité
+                "heures_sup": heures_supp,                 # heures supp (× 1,25 RGDU, base TEPA)
+                "heures_autres": 0.0, "primes_non_soumises": 0.0,
+                "heures_total": heures_total,
                 "fichier_bs": doc_cible["name"], "label_brut": methode_brut,
                 "ligne_brut": ligne_brut,
                 "lignes_diag": rows_diag,                  # pour le panneau diagnostic
@@ -442,7 +461,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
 # ==========================================
 # 5. MOTEUR DE CALCUL MÉTIER
 # ==========================================
-def calculer_comparatif(donnees, is_pacte, taux_smic):
+def calculer_comparatif(donnees, is_pacte, taux_smic, fspi_pct=10.0, formation_pct=0.0):
     const = get_constantes_pacte(is_pacte)
 
     facture = donnees["facture"]["total_facture"]
@@ -482,18 +501,25 @@ def calculer_comparatif(donnees, is_pacte, taux_smic):
     cout_total_mens = brut_mens + bs["primes_non_soumises"] + charges_nettes_mens
     marge_mens = facture - cout_total_mens
 
-    # -- CDII -- (pas d'IFM, pas d'ICCP, surcotisation +3.5%)
-    smic_rgdu_cdii = taux_smic * heures_equiv
-    rgdu_cdii = coef_rgdu(smic_rgdu_cdii, brut_base)
-    charges_nettes_cdii = (brut_base * (TAUX_CHARGES_BASE + TAUX_SURCOTISATION_CDII)) - rgdu_cdii - montant_tepa
+    # -- CDII -- (pas d'IFM ; CP PAYÉE et intégrée à l'assiette car non prise en congés ;
+    #    surcotisation patronale +3.5% AKTO/FSPI ; pas de majoration ICCP)
     cp_cdii = brut_base * 0.10
-    sequestre_total_cdii = cp_cdii * (1 + TAUX_CHARGES_BASE + TAUX_SURCOTISATION_CDII)
-    cout_total_cdii = brut_base + bs["primes_non_soumises"] + charges_nettes_cdii + sequestre_total_cdii
+    brut_cdii = brut_base + cp_cdii                 # CP versée mensuellement -> soumise à cotisations
+    smic_rgdu_cdii = taux_smic * heures_equiv       # SMIC de réf NON majoré ICCP
+    rgdu_cdii = coef_rgdu(smic_rgdu_cdii, brut_cdii)
+    charges_nettes_cdii = (brut_cdii * (TAUX_CHARGES_BASE + TAUX_SURCOTISATION_CDII)) - rgdu_cdii - montant_tepa
+    # Contribution FSPI/AKTO : équivalent IFM (10 % du brut) affecté au fonds formation
+    # (accord de branche du 10/07/2013, art. 5). Réductible par la part réellement
+    # consommée en formation des intérimaires (interne/externe) ; sinon perdue.
+    fspi_cdii = brut_base * (fspi_pct / 100.0) * (1 - formation_pct / 100.0)
+    cout_total_cdii = brut_cdii + bs["primes_non_soumises"] + charges_nettes_cdii + fspi_cdii
     marge_cdii = facture - cout_total_cdii
 
     return {
         "Interimaire": nom,
-        "Heures": round(heures_equiv, 2),
+        "Heures": round(bs.get("heures_total", heures_equiv), 2),
+        "HeuresEquivRGDU": round(heures_equiv, 2),
+        "HeuresSupp": round(bs.get("heures_sup", 0.0), 2),
         "Coef": round(coef_detecte, 2),
         "BrutLu": brut_base,
         "BrutSB": brut_sb,
@@ -510,10 +536,14 @@ def calculer_comparatif(donnees, is_pacte, taux_smic):
         },
         "Data": {
             "Lignes": ["1. Facturation HT", "2. Brut Soumis", "3. Allègement RGDU",
-                       "4. Séquestre ETT (IFM/CP)", "5. COÛT TOTAL", "6. MARGE NETTE"],
-            "CTT (Provision)": [facture, brut_base, -rgdu_prov, sequestre_total_prov, cout_total_prov, marge_prov],
-            "CTT (Mensualisé)": [facture, brut_mens, -rgdu_mens, 0.00, cout_total_mens, marge_mens],
-            "CDII": [facture, brut_base, -rgdu_cdii, sequestre_total_cdii, cout_total_cdii, marge_cdii],
+                       "4. Séquestre ETT (IFM/CP)", "4b. FSPI/AKTO formation (CDII)",
+                       "5. COÛT TOTAL", "6. MARGE NETTE"],
+            "CTT (Provision)": [facture, brut_base, -rgdu_prov, sequestre_total_prov, 0.00,
+                                cout_total_prov, marge_prov],
+            "CTT (Mensualisé)": [facture, brut_mens, -rgdu_mens, 0.00, 0.00,
+                                 cout_total_mens, marge_mens],
+            "CDII": [facture, brut_cdii, -rgdu_cdii, 0.00, fspi_cdii,
+                     cout_total_cdii, marge_cdii],
         },
     }
 
@@ -660,6 +690,17 @@ mois_cible = st.sidebar.selectbox(
     index=4,  # Mai par défaut
 )
 
+st.sidebar.header("CDI Intérimaire (CDII)")
+fspi_pct = st.sidebar.number_input(
+    "Contribution FSPI/AKTO (% du brut)", value=10.0, step=0.5, min_value=0.0,
+    help="Équivalent IFM affecté au fonds formation (accord de branche 10/07/2013, art. 5). "
+         "Versé à AKTO en mars N+1. Pour le CDII uniquement.")
+formation_pct = st.sidebar.slider(
+    "Part récupérée par la formation (%)", 0, 100, 0,
+    help="Fraction des 10 % FSPI réellement consommée en formation des intérimaires "
+         "(interne/externe). 0 % = rien n'est formé → contribution perdue. "
+         "100 % = intégralement récupérée en actions de formation.")
+
 col1, col2 = st.columns(2)
 with col1:
     fichiers_bs = st.file_uploader("📥 Déposer les Bulletins (PDF)", type=["pdf"], accept_multiple_files=True)
@@ -775,7 +816,8 @@ if "dossiers_audit" in st.session_state:
                   "bs": {**d["bs"],
                          "brut_sb": sb,
                          "total_brut": sb / RATIO_SB_BASE}}  # base soumise = SB / 1,21
-        master_results.append(calculer_comparatif(d_calc, is_pacte, taux_smic))
+        master_results.append(calculer_comparatif(d_calc, is_pacte, taux_smic,
+                                                  fspi_pct=fspi_pct, formation_pct=formation_pct))
 
     # Contrôle des coefficients de facturation (soumises vs non soumises), par intérimaire
     controles_coef = {d["facture"]["interimaire"]: controle_coefficients(d) for d in dossiers}
@@ -823,6 +865,11 @@ if "dossiers_audit" in st.session_state:
     st.caption("💡 « Δ Mensualisation » = marge CTT Mensualisé − marge CTT Provision. "
                "Positif → intégrer les IFM/CP en cours de mois est gagnant ; "
                "négatif → mieux vaut les laisser en séquestre tant que la mission n'est pas soldée.")
+    st.caption(f"🎓 Le CDII intègre la contribution FSPI/AKTO ({fspi_pct:.0f} % du brut, équivalent IFM "
+               "affecté au fonds formation, accord de branche du 10/07/2013). Réglage actuel : "
+               f"{formation_pct:.0f} % récupéré par la formation. Le CDII n'est réellement rentable "
+               "que si vous consommez cette contribution en formant vos intérimaires — sinon elle "
+               "est perdue. Ajustez le curseur « Part récupérée par la formation » pour voir le seuil.")
 
     # Synthèse des anomalies de coefficient de facturation
     anomalies_coef = [(nom, c) for nom, c in controles_coef.items() if c["alertes"]]
@@ -882,6 +929,9 @@ if "dossiers_audit" in st.session_state:
             else:
                 st.caption(f"Brut social (SB) : **{r['BrutSB']:.2f} €** · base soumise "
                            f"{r['BrutLu']:.2f} € (SB ÷ 1,21) · source : {r['FichierBS']} · {r['LabelBrut']}")
+                st.caption(f"⏱️ Heures : {r['Heures']:.2f} h travaillées dont {r['HeuresSupp']:.2f} h supp "
+                           f"→ base RGDU = {r['HeuresEquivRGDU']:.2f} h équivalentes "
+                           "(normales + supp × 1,25). Les heures supp basculent sous TEPA.")
                 if r["Coef"] > 3.0:
                     st.error(f"⚠️ Coefficient anormalement élevé ({r['Coef']}) — probable "
                              "décalage facture/BS (période, temps partiel, brut erroné). À vérifier.")
