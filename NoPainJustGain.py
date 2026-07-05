@@ -26,8 +26,9 @@ MOIS_LABELS = {
 # ==========================================
 # 2. OUTILS DE PARSING GÉNÉRIQUES
 # ==========================================
-# Nombre au format FR : 1 234,56 / 1234,56 / 3 170,11 (espaces, insécables, points de milliers)
-_MONTANT_FR = r"\d{1,3}(?:[ \u00a0\u202f.]\d{3})*,\d{2}|\d+,\d{2}"
+# Nombre au format FR : 1 234,56 / 1234,56 / 3 170,108 (2 à 3 décimales ; les colonnes
+# IFM/CP des bulletins affichent 3 décimales, ce qui casserait un parsing figé à 2 décimales).
+_MONTANT_FR = r"\d{1,3}(?:[ \u00a0\u202f.]\d{3})*,\d{2,3}|\d+,\d{2,3}"
 
 def parse_montant_fr(s):
     """Convertit un montant FR ('3 170,11' / '3.170,11' / '2393,78') en float."""
@@ -149,25 +150,40 @@ def grouper_lignes_depuis_mots(mots, tol=3.0):
         lignes.append(" ".join(m["text"] for m in r["mots"]))
     return lignes
 
+# SB (colonne « = BRUT ») = base + IFM(10%) + CP(10% sur base+IFM) = 1,21 × base.
+# On dérive donc la base soumise à partir du SB lu.
+RATIO_SB_BASE = 1.21
+_RE_SB = re.compile(r"(?<![A-Za-zÀ-ÿ0-9])S\.?\s?B\.?(?![A-Za-zÀ-ÿ0-9])")
+
 def brut_depuis_rows(rows):
     """
     Extrait le brut social depuis des lignes visuelles reconstruites.
-    Priorité : token 'SB' (bloc SOUMISES À COTISATIONS / TOTAUX, colonne de droite)
-    > libellés explicites > 'brut' seul. Retourne (brut, methode).
+    Structure BESTT/paie : ligne TOTAUX du bloc « SOUMISES À COTISATIONS » avec les
+    colonnes MONTANT | +IFM | +CP | = BRUT, et le code « SB » en marge de DROITE,
+    juste APRÈS la valeur du brut.
+    Retourne (sb, base, methode, ligne_source) ; (None, None, None, None) si rien
+    (à distinguer d'un brut réellement égal à 0).
     """
     def montants(s):
-        return re.findall(_MONTANT_FR, s)
+        return [parse_montant_fr(x) for x in re.findall(_MONTANT_FR, s)]
 
-    # 1) Token 'SB' / 'S.B.' -> PREMIER montant à sa droite (colonne SB du bloc TOTAUX)
-    re_sb = re.compile(r"(?<![A-Za-zÀ-ÿ])S\.?\s?B\.?(?![A-Za-zÀ-ÿ])")
+    # 1) Code « SB » : le BRUT est le DERNIER montant AVANT le code SB (marge de droite).
     for r in rows:
-        m = re_sb.search(r)
+        m = _RE_SB.search(r)
         if m:
-            ms = montants(r[m.end():])
-            if ms:
-                return parse_montant_fr(ms[0]), "SB (bloc soumis à cotisations)"
+            avant = montants(r[:m.start()])
+            if avant:
+                sb = avant[-1]
+                base = sb / RATIO_SB_BASE
+                # Si les 4 colonnes MONTANT/IFM/CP/BRUT sont présentes et cohérentes,
+                # on prend la base exacte (colonne MONTANT) plutôt que la dérivation.
+                if len(avant) >= 4:
+                    b, i, c, br = avant[-4], avant[-3], avant[-2], avant[-1]
+                    if br > 0 and abs((b + i + c) - br) <= max(0.05, 0.01 * br):
+                        base, sb = b, br
+                return sb, base, "SB (colonne « = BRUT »)", r
 
-    # 2) Libellés explicites -> montant le plus à droite de la ligne
+    # 2) Libellés explicites -> montant = SB, base dérivée
     libelles = [
         (r"salaire\s+brut(?:\s+imposable)?", "Salaire brut"),
         (r"brut\s+social", "Brut social"),
@@ -182,37 +198,54 @@ def brut_depuis_rows(rows):
             if rx.search(r):
                 ms = montants(r)
                 if ms:
-                    return parse_montant_fr(ms[-1]), name
+                    sb = ms[-1]
+                    return sb, sb / RATIO_SB_BASE, name, r
 
     # 3) 'brut' seul -> dernier montant
     for r in rows:
         if re.search(r"\bbrut\b", r, re.IGNORECASE):
             ms = montants(r)
             if ms:
-                return parse_montant_fr(ms[-1]), "Brut"
+                sb = ms[-1]
+                return sb, sb / RATIO_SB_BASE, "Brut", r
 
-    return 0.0, None
+    return None, None, None, None
 
 def extraire_brut(texte, mots=None):
     """
-    Retourne (brut, methode). Si `mots` (coordonnées) est fourni, on reconstruit
-    les lignes visuelles (robuste aux colonnes) ; sinon on retombe sur le texte brut.
+    Retourne (sb, base, methode, ligne_source, lignes_visuelles).
+    sb = brut social (colonne = BRUT, inclut IFM/CP) ; base = sb / 1,21 (base soumise).
+    sb = None si aucune ligne de brut n'est identifiée (≠ brut = 0).
     """
     if mots:
         rows = grouper_lignes_depuis_mots(mots)
-        brut, methode = brut_depuis_rows(rows)
-        if brut > 0:
-            return brut, methode
-    return brut_depuis_rows(texte.split("\n"))
+        sb, base, methode, ligne = brut_depuis_rows(rows)
+        if sb is not None:
+            return sb, base, methode, ligne, rows
+        sb2, base2, methode2, ligne2 = brut_depuis_rows(texte.split("\n"))
+        return sb2, base2, methode2, ligne2, rows
+    rows = texte.split("\n")
+    sb, base, methode, ligne = brut_depuis_rows(rows)
+    return sb, base, methode, ligne, rows
 
-def extraire_heures(texte, defaut=151.67):
-    lignes = texte.split("\n")
+def extraire_heures(texte, rows=None, defaut=151.67):
+    """Heures totales travaillées : priorité à la ligne TOTAUX « HEURES : X h »."""
+    candidats = rows if rows else texte.split("\n")
+    # 1) Total explicite « HEURES : 199,15 h » (ligne TOTAUX du bloc soumis)
+    for r in candidats:
+        m = re.search(r"HEURES\s*:?\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*h", r, re.IGNORECASE)
+        if m:
+            g = m.group(1)
+            val = parse_montant_fr(g) if "," in g else float(g)
+            if 1 <= val <= 400:
+                return val
+    # 2) Repli : libellés d'heures classiques
     for label in _LABELS_HEURES:
         rx = re.compile(label, re.IGNORECASE)
-        for ligne in lignes:
+        for ligne in candidats:
             if rx.search(ligne):
-                for m in re.findall(r"\d{1,3}(?:[.,]\d{1,2})?", ligne):
-                    val = parse_montant_fr(m) if "," in m else float(m.replace(",", "."))
+                for mm in re.findall(r"\d{1,3}(?:[.,]\d{1,2})?", ligne):
+                    val = parse_montant_fr(mm) if "," in mm else float(mm.replace(",", "."))
                     if 1 <= val <= 400:
                         return val
     return defaut
@@ -256,18 +289,27 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                     break
 
         if doc_cible:
-            brut, methode_brut = extraire_brut(doc_cible["texte"], doc_cible["mots"])
-            heures = extraire_heures(doc_cible["texte"])
+            sb, base, methode_brut, ligne_brut, rows_diag = extraire_brut(
+                doc_cible["texte"], doc_cible["mots"])
+            heures = extraire_heures(doc_cible["texte"], rows_diag)
+            trouve = sb is not None
             bs_data = {
-                "total_brut": brut, "heures_normales": heures,
+                "brut_sb": sb if trouve else 0.0,          # brut social affiché (inclut IFM/CP)
+                "total_brut": base if trouve else 0.0,     # base soumise (= SB/1,21) pour le calcul
+                "brut_trouve": trouve,                     # distingue "introuvable" de "= 0,00"
+                "heures_normales": heures,
                 "heures_sup": 0.0, "heures_autres": 0.0, "primes_non_soumises": 0.0,
                 "fichier_bs": doc_cible["name"], "label_brut": methode_brut,
+                "ligne_brut": ligne_brut,
+                "lignes_diag": rows_diag,                  # pour le panneau diagnostic
             }
         else:
             bs_data = {
-                "total_brut": 0.0, "heures_normales": 0.0, "heures_sup": 0.0,
-                "heures_autres": 0.0, "primes_non_soumises": 0.0,
+                "brut_sb": 0.0, "total_brut": 0.0, "brut_trouve": False,
+                "heures_normales": 0.0, "heures_sup": 0.0, "heures_autres": 0.0,
+                "primes_non_soumises": 0.0,
                 "fichier_bs": None, "label_brut": None,
+                "ligne_brut": None, "lignes_diag": [],
             }
         resultats.append({"facture": fact, "bs": bs_data})
     return resultats
@@ -283,7 +325,8 @@ def calculer_comparatif(donnees, is_pacte, taux_smic):
     nom = donnees["facture"]["interimaire"]
 
     bs = donnees["bs"]
-    brut_base = bs["total_brut"]
+    brut_base = bs["total_brut"]                    # base soumise (= SB / 1,21)
+    brut_sb = bs.get("brut_sb", brut_base * RATIO_SB_BASE)  # brut social affiché (inclut IFM/CP)
     coef_detecte = facture / brut_base if brut_base > 0 else 0
 
     heures_equiv = bs["heures_normales"] + bs["heures_autres"] + (bs["heures_sup"] * MAJORATION_HS)
@@ -328,8 +371,12 @@ def calculer_comparatif(donnees, is_pacte, taux_smic):
         "Heures": round(heures_equiv, 2),
         "Coef": round(coef_detecte, 2),
         "BrutLu": brut_base,
+        "BrutSB": brut_sb,
+        "BrutTrouve": bs.get("brut_trouve", brut_base > 0),
         "FichierBS": bs.get("fichier_bs"),
         "LabelBrut": bs.get("label_brut"),
+        "LigneBrut": bs.get("ligne_brut"),
+        "LignesDiag": bs.get("lignes_diag", []),
         "LignesRetenues": lignes_facture,
         "Marges": {
             "CTT (Provision)": round(marge_prov, 2),
@@ -413,29 +460,61 @@ if "dossiers_audit" in st.session_state:
     # VÉRIFICATION / CORRECTION MANUELLE DU BRUT (garde-fou)
     # ----------------------------------------------------------
     st.header("🧾 Vérification du brut social (SB)")
-    st.caption("Brut lu automatiquement sur chaque bulletin (bloc « soumis à cotisations »). "
-               "Modifiable : marges, graphiques et recommandations se recalculent aussitôt.")
+    st.caption("Le brut social **SB** (colonne « = BRUT » du bloc soumis à cotisations, IFM + CP inclus) "
+               "est lu automatiquement, puis la **base soumise** est dérivée (SB ÷ 1,21) pour les calculs. "
+               "Le SB est modifiable : tout se recalcule aussitôt. "
+               "Un SB détecté à 0,00 € n'est pas une erreur de lecture mais une anomalie de paie signalée.")
 
-    brut_effectif = {}
+    sb_effectif = {}
     for d in dossiers:
         nom = d["facture"]["interimaire"]
-        auto = float(d["bs"]["total_brut"])
-        methode = d["bs"].get("label_brut")
-        fichier = d["bs"].get("fichier_bs") or "—"
+        bs = d["bs"]
+        auto_sb = float(bs.get("brut_sb", 0.0))
+        trouve = bs.get("brut_trouve", auto_sb > 0)
+        methode = bs.get("label_brut")
+        fichier = bs.get("fichier_bs") or "—"
+        ligne_brut = bs.get("ligne_brut")
 
         key = f"brut_{nom}"
         if key not in st.session_state:
-            st.session_state[key] = auto  # valeur initiale = détection auto
+            st.session_state[key] = auto_sb  # valeur initiale = SB détecté
 
         c_nom, c_src, c_val = st.columns([2, 3, 2])
         c_nom.markdown(f"**{nom}**")
-        if auto == 0.0:
-            c_src.caption(f"BS : {fichier} · ⚠️ non détecté — saisir le brut manuellement")
+        if not trouve:
+            c_src.caption(f"BS : {fichier} · 🔴 **SB introuvable** — à saisir à droite")
+        elif auto_sb == 0.0:
+            c_src.caption(f"BS : {fichier} · ⚠️ SB détecté = 0,00 € (anomalie de paie)")
         else:
-            c_src.caption(f"BS : {fichier} · auto : {methode} → {auto:.2f} €")
-        val = c_val.number_input("Brut soumis (€)", min_value=0.0, step=10.0,
-                                 key=key, label_visibility="collapsed")
-        brut_effectif[nom] = val
+            c_src.caption(f"BS : {fichier} · ✅ {methode} → SB {auto_sb:.2f} € "
+                          f"(base ≈ {auto_sb / RATIO_SB_BASE:.2f} €)")
+            if ligne_brut:
+                c_src.caption(f"↳ ligne : `{ligne_brut[:90]}`")
+        sb_val = c_val.number_input("Brut social SB (€)", min_value=0.0, step=10.0,
+                                    key=key, label_visibility="collapsed")
+        sb_effectif[nom] = sb_val
+
+    # Panneau diagnostic global : montre où le parser lit sur chaque BS
+    with st.expander("🔬 Diagnostic de lecture des BS (pour identifier la bonne ligne de brut)",
+                     expanded=False):
+        st.caption("Pour chaque bulletin, voici les lignes reconstruites et les montants repérés. "
+                   "Repérez la valeur exacte du brut : si le parser ne tombe pas dessus, "
+                   "corrigez à la main ci-dessus et indiquez-moi le libellé exact de cette ligne "
+                   "pour que je fiabilise la détection automatique.")
+        for d in dossiers:
+            nom = d["facture"]["interimaire"]
+            bs = d["bs"]
+            with st.expander(f"BS de {nom} — {bs.get('fichier_bs') or '—'}", expanded=False):
+                lignes_diag = bs.get("lignes_diag") or []
+                if not lignes_diag:
+                    st.caption("Aucune ligne exploitable (PDF scanné/image ? → OCR requis).")
+                choisie = bs.get("ligne_brut")
+                for ligne in lignes_diag:
+                    montants = re.findall(_MONTANT_FR, ligne)
+                    if not montants:
+                        continue
+                    marqueur = "➡️ **[LIGNE RETENUE]** " if ligne == choisie else ""
+                    st.markdown(f"{marqueur}`{ligne}`  —  montants : {', '.join(montants)}")
 
     # ----------------------------------------------------------
     # CALCUL (avec brut éventuellement corrigé, sans muter l'auto)
@@ -443,8 +522,11 @@ if "dossiers_audit" in st.session_state:
     master_results = []
     for d in dossiers:
         nom = d["facture"]["interimaire"]
+        sb = sb_effectif[nom]
         d_calc = {"facture": d["facture"],
-                  "bs": {**d["bs"], "total_brut": brut_effectif[nom]}}
+                  "bs": {**d["bs"],
+                         "brut_sb": sb,
+                         "total_brut": sb / RATIO_SB_BASE}}  # base soumise = SB / 1,21
         master_results.append(calculer_comparatif(d_calc, is_pacte, taux_smic))
 
     # ----------------------------------------------------------
@@ -511,21 +593,38 @@ if "dossiers_audit" in st.session_state:
         return [""] * len(row)
 
     for r in master_results:
-        alerte_ocr = "⚠️ BRUT = 0 !" if r["BrutLu"] == 0.0 else ""
+        brut0 = r["BrutLu"] == 0.0
+        trouve = r.get("BrutTrouve", not brut0)
+        if brut0 and not trouve:
+            badge = "🔴 BRUT INTROUVABLE"
+        elif brut0:
+            badge = "⚠️ BRUT = 0 (anomalie)"
+        elif r["Coef"] and r["Coef"] > 3.0:
+            badge = "⚠️ COEF ANORMAL"
+        else:
+            badge = ""
         best, delta, signal = recommander_statut(r["Marges"])
 
         with st.expander(
             f"Dossier : {r['Interimaire']} | Coef : {r['Coef']} | Heures : {r['Heures']}h "
-            f"| Optimal : {best} {alerte_ocr}",
+            f"| Optimal : {best} {badge}",
             expanded=True,
         ):
-            if r["BrutLu"] == 0.0:
-                st.error("Brut à 0 € : la lecture automatique a échoué. "
-                         "Saisissez le brut social dans la section « Vérification du brut » ci-dessus.")
+            if brut0 and not trouve:
+                st.error("🔴 Brut introuvable sur ce bulletin : la lecture automatique a échoué. "
+                         "Saisissez le brut dans « Vérification du brut social » ci-dessus "
+                         "(voir aussi le panneau 🔬 Diagnostic pour repérer la bonne ligne).")
+            elif brut0:
+                st.warning("⚠️ Brut détecté = 0,00 € : anomalie de paie (intérimaire facturé mais "
+                           "non rémunéré sur le mois). Coefficient et marges non calculables en l'état.")
             else:
-                st.caption(f"Brut retenu : {r['BrutLu']:.2f} € (source : {r['FichierBS']} · {r['LabelBrut']})")
-                if r["Coef"] < 1.82:
-                    st.error(f"⚠️ Alerte : coefficient bas détecté ({r['Coef']}) — seuil conseillé ≥ 1,82")
+                st.caption(f"Brut social (SB) : **{r['BrutSB']:.2f} €** · base soumise "
+                           f"{r['BrutLu']:.2f} € (SB ÷ 1,21) · source : {r['FichierBS']} · {r['LabelBrut']}")
+                if r["Coef"] > 3.0:
+                    st.error(f"⚠️ Coefficient anormalement élevé ({r['Coef']}) — probable "
+                             "décalage facture/BS (période, temps partiel, brut erroné). À vérifier.")
+                elif r["Coef"] < 1.82:
+                    st.error(f"⚠️ Coefficient bas détecté ({r['Coef']}) — seuil conseillé ≥ 1,82")
                 else:
                     st.success(f"✅ Coefficient commercial validé : {r['Coef']}")
                 st.info(signal)
