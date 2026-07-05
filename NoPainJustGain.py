@@ -216,9 +216,15 @@ def brut_depuis_rows(rows):
             if avant:
                 sb = avant[-1]
                 base = sb / RATIO_SB_BASE
-                # Si les 4 colonnes MONTANT/IFM/CP/BRUT sont présentes et cohérentes,
-                # on prend la base exacte (colonne MONTANT) plutôt que la dérivation.
-                if len(avant) >= 4:
+                # Base exacte = colonne MONTANT = 1er montant APRÈS le repère d'heures « Xh ».
+                # Vérifie MONTANT (+IFM) (+CP) = BRUT. Gère les 3 cas : IFM+CP (÷1,21),
+                # IFM seul ou CP seul (÷1,10) — ex. MARIAN, CP sans IFM.
+                mh = re.search(r"\d[\d\u00a0 .]*,\d+\s*h", r[:m.start()])
+                apres = montants(r[mh.end():m.start()]) if mh else []
+                if (len(apres) >= 2 and apres[-1] > 0
+                        and abs(sum(apres[:-1]) - apres[-1]) <= max(0.05, 0.01 * apres[-1])):
+                    base, sb = apres[0], apres[-1]
+                elif len(avant) >= 4:   # repli : 4 colonnes cohérentes
                     b, i, c, br = avant[-4], avant[-3], avant[-2], avant[-1]
                     if br > 0 and abs((b + i + c) - br) <= max(0.05, 0.01 * br):
                         base, sb = b, br
@@ -431,9 +437,11 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
             heures_normales = max(0.0, round(heures_total - heures_supp, 2))
             taux_bs, taux_variables, cout_panier = extraire_taux_bs(doc_cible["texte"])
             trouve = sb is not None
+            ratio_sb_base = (sb / base) if (trouve and base and base > 0) else RATIO_SB_BASE
             bs_data = {
                 "brut_sb": sb if trouve else 0.0,          # brut social affiché (inclut IFM/CP)
-                "total_brut": base if trouve else 0.0,     # base soumise (= SB/1,21) pour le calcul
+                "total_brut": base if trouve else 0.0,     # base soumise (colonne MONTANT du BS)
+                "ratio_sb_base": round(ratio_sb_base, 4),  # 1,21 (IFM+CP) ou 1,10 (IFM ou CP seul)
                 "brut_trouve": trouve,                     # distingue "introuvable" de "= 0,00"
                 "heures_normales": heures_normales,        # normales + nuit/dimanche + JF + solidarité
                 "heures_sup": heures_supp,                 # heures supp (× 1,25 RGDU, base TEPA)
@@ -448,6 +456,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
         else:
             bs_data = {
                 "brut_sb": 0.0, "total_brut": 0.0, "brut_trouve": False,
+                "ratio_sb_base": RATIO_SB_BASE,
                 "heures_normales": 0.0, "heures_sup": 0.0, "heures_autres": 0.0,
                 "primes_non_soumises": 0.0,
                 "fichier_bs": None, "label_brut": None,
@@ -812,10 +821,11 @@ if "dossiers_audit" in st.session_state:
     for d in dossiers:
         nom = d["facture"]["interimaire"]
         sb = sb_effectif[nom]
+        ratio = d["bs"].get("ratio_sb_base", RATIO_SB_BASE)
         d_calc = {"facture": d["facture"],
                   "bs": {**d["bs"],
                          "brut_sb": sb,
-                         "total_brut": sb / RATIO_SB_BASE}}  # base soumise = SB / 1,21
+                         "total_brut": sb / ratio}}  # base = SB ÷ ratio réel (1,21, ou 1,10 si IFM/CP seul)
         master_results.append(calculer_comparatif(d_calc, is_pacte, taux_smic,
                                                   fspi_pct=fspi_pct, formation_pct=formation_pct))
 
@@ -927,18 +937,34 @@ if "dossiers_audit" in st.session_state:
                 st.warning("⚠️ Brut détecté = 0,00 € : anomalie de paie (intérimaire facturé mais "
                            "non rémunéré sur le mois). Coefficient et marges non calculables en l'état.")
             else:
-                st.caption(f"Brut social (SB) : **{r['BrutSB']:.2f} €** · base soumise "
-                           f"{r['BrutLu']:.2f} € (SB ÷ 1,21) · source : {r['FichierBS']} · {r['LabelBrut']}")
+                _ratio = r['BrutSB'] / r['BrutLu'] if r['BrutLu'] > 0 else RATIO_SB_BASE
+                _struct = ("IFM + CP" if abs(_ratio - 1.21) < 0.02
+                           else "IFM ou CP seul" if abs(_ratio - 1.10) < 0.02
+                           else "structure atypique")
+                st.caption(f"Brut social (SB) : **{r['BrutSB']:.2f} €** · base soumise (colonne MONTANT) "
+                           f"{r['BrutLu']:.2f} € · ratio SB/base = {_ratio:.2f} ({_struct}) · "
+                           f"source : {r['FichierBS']} · {r['LabelBrut']}")
                 st.caption(f"⏱️ Heures : {r['Heures']:.2f} h travaillées dont {r['HeuresSupp']:.2f} h supp "
                            f"→ base RGDU = {r['HeuresEquivRGDU']:.2f} h équivalentes "
                            "(normales + supp × 1,25). Les heures supp basculent sous TEPA.")
+                st.caption(f"📊 Coefficient de rentabilité global : **{r['Coef']}** "
+                           "(Facture mai ÷ base soumise). Indicateur global, dilué par les postes "
+                           "refacturés hors marge (panier à 1,00, primes exceptionnelles à prix coûtant) "
+                           "— à ne pas confondre avec le coefficient commercial ci-dessous.")
                 if r["Coef"] > 3.0:
-                    st.error(f"⚠️ Coefficient anormalement élevé ({r['Coef']}) — probable "
-                             "décalage facture/BS (période, temps partiel, brut erroné). À vérifier.")
-                elif r["Coef"] < 1.82:
-                    st.error(f"⚠️ Coefficient bas détecté ({r['Coef']}) — seuil conseillé ≥ 1,82")
+                    st.warning(f"⚠️ Ratio global très élevé ({r['Coef']}) — possible décalage de période "
+                               "facture/BS (temps partiel, brut erroné). À vérifier.")
+                # Alerte sur le VRAI indicateur : le coefficient commercial (main-d'œuvre)
+                _ctrl = controles_coef.get(r["Interimaire"])
+                _cc = _ctrl["coef_commercial"] if _ctrl else None
+                if _cc is None:
+                    st.caption("Coefficient commercial non déterminé (pas de ligne d'heures exploitable).")
+                elif _cc < 1.82:
+                    st.error(f"⚠️ Coefficient commercial bas ({_cc:.2f}) — seuil conseillé ≥ 1,82 : "
+                             "sous-facturation probable de la main-d'œuvre.")
                 else:
-                    st.success(f"✅ Coefficient commercial validé : {r['Coef']}")
+                    st.success(f"✅ Coefficient commercial validé : {_cc:.2f} "
+                               "(main-d'œuvre facturée au bon taux).")
                 st.info(signal)
 
             # --- CONTRÔLE DES COEFFICIENTS DE FACTURATION (réconciliation BS vs Facture) ---
