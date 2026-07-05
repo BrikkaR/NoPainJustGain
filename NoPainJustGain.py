@@ -121,25 +121,89 @@ def lire_factures_bestt_consolidees(fichiers_factures, mois_cible="05"):
 # ==========================================
 # 4. MOTEUR D'EXTRACTION BULLETINS DE SALAIRE
 # ==========================================
-_LABELS_BRUT = [
-    r"TOTAL\s+BRUT", r"BRUT\s+TOTAL", r"SALAIRE\s+BRUT(?:\s+IMPOSABLE)?",
-    r"BRUT\s+SOCIAL", r"R[ÉE]MUN[ÉE]RATION\s+BRUTE", r"BRUT\s+FISCAL", r"\bBRUT\b",
-]
 _LABELS_HEURES = [
     r"Heures?\s+normales?", r"Temps\s+de\s+travail", r"Salaire\s+de\s+base", r"\bBase\b",
 ]
 
-def extraire_brut(texte):
-    """Retourne (brut, libelle_utilise). Prend le dernier montant de la 1re ligne libellée."""
-    lignes = texte.split("\n")
-    for label in _LABELS_BRUT:
-        rx = re.compile(label, re.IGNORECASE)
-        for ligne in lignes:
-            if rx.search(ligne):
-                montants = _tous_les_montants(ligne)
-                if montants:
-                    return montants[-1], label
+def grouper_lignes_depuis_mots(mots, tol=3.0):
+    """
+    Reconstruit les lignes VISUELLES d'une page à partir des mots positionnés
+    (pdfplumber extract_words). Indispensable pour les bulletins en colonnes :
+    le libellé 'SB' et sa valeur, à droite, se retrouvent sur la même ligne,
+    et le montant '2 393,78' (fragmenté par l'espace des milliers) est reformé.
+    """
+    rows = []
+    for w in sorted(mots, key=lambda m: (m["top"], m["x0"])):
+        placed = False
+        for r in rows:
+            if abs(r["top"] - w["top"]) <= tol:
+                r["mots"].append(w)
+                r["top"] = (r["top"] * (len(r["mots"]) - 1) + w["top"]) / len(r["mots"])
+                placed = True
+                break
+        if not placed:
+            rows.append({"top": w["top"], "mots": [w]})
+    lignes = []
+    for r in sorted(rows, key=lambda r: r["top"]):
+        r["mots"].sort(key=lambda m: m["x0"])
+        lignes.append(" ".join(m["text"] for m in r["mots"]))
+    return lignes
+
+def brut_depuis_rows(rows):
+    """
+    Extrait le brut social depuis des lignes visuelles reconstruites.
+    Priorité : token 'SB' (bloc SOUMISES À COTISATIONS / TOTAUX, colonne de droite)
+    > libellés explicites > 'brut' seul. Retourne (brut, methode).
+    """
+    def montants(s):
+        return re.findall(_MONTANT_FR, s)
+
+    # 1) Token 'SB' / 'S.B.' -> PREMIER montant à sa droite (colonne SB du bloc TOTAUX)
+    re_sb = re.compile(r"(?<![A-Za-zÀ-ÿ])S\.?\s?B\.?(?![A-Za-zÀ-ÿ])")
+    for r in rows:
+        m = re_sb.search(r)
+        if m:
+            ms = montants(r[m.end():])
+            if ms:
+                return parse_montant_fr(ms[0]), "SB (bloc soumis à cotisations)"
+
+    # 2) Libellés explicites -> montant le plus à droite de la ligne
+    libelles = [
+        (r"salaire\s+brut(?:\s+imposable)?", "Salaire brut"),
+        (r"brut\s+social", "Brut social"),
+        (r"total\s+brut", "Total brut"),
+        (r"brut\s+total", "Brut total"),
+        (r"r[ée]mun[ée]ration\s+brute", "Rémunération brute"),
+        (r"brut\s+fiscal", "Brut fiscal"),
+    ]
+    for pattern, name in libelles:
+        rx = re.compile(pattern, re.IGNORECASE)
+        for r in rows:
+            if rx.search(r):
+                ms = montants(r)
+                if ms:
+                    return parse_montant_fr(ms[-1]), name
+
+    # 3) 'brut' seul -> dernier montant
+    for r in rows:
+        if re.search(r"\bbrut\b", r, re.IGNORECASE):
+            ms = montants(r)
+            if ms:
+                return parse_montant_fr(ms[-1]), "Brut"
+
     return 0.0, None
+
+def extraire_brut(texte, mots=None):
+    """
+    Retourne (brut, methode). Si `mots` (coordonnées) est fourni, on reconstruit
+    les lignes visuelles (robuste aux colonnes) ; sinon on retombe sur le texte brut.
+    """
+    if mots:
+        rows = grouper_lignes_depuis_mots(mots)
+        brut, methode = brut_depuis_rows(rows)
+        if brut > 0:
+            return brut, methode
+    return brut_depuis_rows(texte.split("\n"))
 
 def extraire_heures(texte, defaut=151.67):
     lignes = texte.split("\n")
@@ -153,15 +217,24 @@ def extraire_heures(texte, defaut=151.67):
                         return val
     return defaut
 
+def _lire_bs(fichiers_bs):
+    """Lit chaque BS : texte (pour l'association nom) + mots positionnés (pour le brut)."""
+    docs = []
+    for f in fichiers_bs:
+        texte, mots = "", []
+        with pdfplumber.open(f) as pdf:
+            for i, p in enumerate(pdf.pages):
+                texte += (p.extract_text() or "") + "\n"
+                for w in (p.extract_words() or []):
+                    # décalage vertical par page pour ne pas fusionner des lignes de pages différentes
+                    mots.append({"text": w["text"], "x0": w["x0"], "x1": w["x1"],
+                                 "top": w["top"] + i * 100000, "bottom": w["bottom"] + i * 100000})
+        docs.append({"name": f.name, "texte": texte, "mots": mots})
+    return docs
+
 def extraire_et_associer_bs(fichiers_bs, factures_data):
     """Associe les données de paie exactes aux factures consolidées."""
-    textes_bs = []
-    for f in fichiers_bs:
-        texte = ""
-        with pdfplumber.open(f) as pdf:
-            for p in pdf.pages:
-                texte += (p.extract_text() or "") + "\n"
-        textes_bs.append((f.name, texte))
+    docs = _lire_bs(fichiers_bs)
 
     resultats = []
     for fact in factures_data:
@@ -170,25 +243,25 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
         nom_famille = mots_nom[0]           # NOM (souvent en majuscules, distinctif)
         prenom = mots_nom[-1] if len(mots_nom) > 1 else ""
 
-        texte_cible, fichier_cible = None, None
+        doc_cible = None
         # 1) match strict NOM + Prénom, 2) fallback sur le NOM seul
-        for fname, texte in textes_bs:
-            if nom_famille in texte and (not prenom or prenom in texte):
-                texte_cible, fichier_cible = texte, fname
+        for d in docs:
+            if nom_famille in d["texte"] and (not prenom or prenom in d["texte"]):
+                doc_cible = d
                 break
-        if texte_cible is None:
-            for fname, texte in textes_bs:
-                if nom_famille in texte:
-                    texte_cible, fichier_cible = texte, fname
+        if doc_cible is None:
+            for d in docs:
+                if nom_famille in d["texte"]:
+                    doc_cible = d
                     break
 
-        if texte_cible:
-            brut, label_brut = extraire_brut(texte_cible)
-            heures = extraire_heures(texte_cible)
+        if doc_cible:
+            brut, methode_brut = extraire_brut(doc_cible["texte"], doc_cible["mots"])
+            heures = extraire_heures(doc_cible["texte"])
             bs_data = {
                 "total_brut": brut, "heures_normales": heures,
                 "heures_sup": 0.0, "heures_autres": 0.0, "primes_non_soumises": 0.0,
-                "fichier_bs": fichier_cible, "label_brut": label_brut,
+                "fichier_bs": doc_cible["name"], "label_brut": methode_brut,
             }
         else:
             bs_data = {
@@ -313,124 +386,170 @@ if st.button("Lancer l'Audit Automatique", type="primary"):
         with st.spinner("Consolidation des factures et lecture des BS en cours..."):
             factures_consolidees = lire_factures_bestt_consolidees(fichiers_factures, mois_cible=mois_cible)
             dossiers_complets = extraire_et_associer_bs(fichiers_bs, factures_consolidees)
-            master_results = [calculer_comparatif(d, is_pacte, taux_smic) for d in dossiers_complets]
 
-        if not master_results:
+        if not dossiers_complets:
             st.error("Aucun intérimaire n'a pu être consolidé sur le mois cible. "
                      "Vérifiez le mois sélectionné et le format des factures.")
             st.stop()
 
-        st.success(f"Audit terminé — mois {mois_cible} ({MOIS_LABELS[mois_cible]}). "
-                   "Rapprochement Factures / BS effectué.")
+        # On mémorise les données BRUTES extraites (brut auto inclus) et on réinitialise
+        # les corrections manuelles éventuelles d'un audit précédent.
+        st.session_state["dossiers_audit"] = dossiers_complets
+        st.session_state["mois_audit"] = mois_cible
+        for k in [k for k in st.session_state.keys() if k.startswith("brut_")]:
+            del st.session_state[k]
 
-        # ----------------------------------------------------------
-        # SYNTHÈSE GRAPHIQUE : choix de contrat & intégration IFM/CP
-        # ----------------------------------------------------------
-        st.header("📊 Synthèse : choix du contrat optimal")
+# ==========================================================
+# RENDU (hors bouton) : recalcul à chaque modification du brut
+# ==========================================================
+if "dossiers_audit" in st.session_state:
+    dossiers = st.session_state["dossiers_audit"]
+    mois_audit = st.session_state.get("mois_audit", mois_cible)
 
-        rows = []
-        for r in master_results:
-            for statut, marge in r["Marges"].items():
-                rows.append({"Intérimaire": r["Interimaire"], "Statut": statut, "Marge (€)": marge})
-        df_graph = pd.DataFrame(rows)
+    st.success(f"Audit — mois {mois_audit} ({MOIS_LABELS[mois_audit]}). "
+               "Rapprochement Factures / BS effectué.")
 
-        couleurs = {
-            "CTT (Provision)": "#1f77b4",
-            "CTT (Mensualisé)": "#ff7f0e",
-            "CDII": "#2ca02c",
-        }
-        fig = px.bar(
-            df_graph, x="Intérimaire", y="Marge (€)", color="Statut",
-            barmode="group", color_discrete_map=couleurs, text_auto=".0f",
-            title="Marge nette comparée par statut (le plus haut = optimal)",
-        )
-        fig.update_layout(legend_title_text="Statut", yaxis_title="Marge nette (€)",
-                          xaxis_title="", uniformtext_minsize=8, uniformtext_mode="hide")
-        fig.add_hline(y=0, line_dash="dash", line_color="grey")
-        st.plotly_chart(fig, use_container_width=True)
+    # ----------------------------------------------------------
+    # VÉRIFICATION / CORRECTION MANUELLE DU BRUT (garde-fou)
+    # ----------------------------------------------------------
+    st.header("🧾 Vérification du brut social (SB)")
+    st.caption("Brut lu automatiquement sur chaque bulletin (bloc « soumis à cotisations »). "
+               "Modifiable : marges, graphiques et recommandations se recalculent aussitôt.")
 
-        # Totaux + recommandations globales
-        totaux = df_graph.groupby("Statut")["Marge (€)"].sum()
-        c1, c2, c3 = st.columns(3)
-        for col, statut in zip((c1, c2, c3), ["CTT (Provision)", "CTT (Mensualisé)", "CDII"]):
-            col.metric(f"Total {statut}", f"{totaux.get(statut, 0):,.0f} €".replace(",", " "))
+    brut_effectif = {}
+    for d in dossiers:
+        nom = d["facture"]["interimaire"]
+        auto = float(d["bs"]["total_brut"])
+        methode = d["bs"].get("label_brut")
+        fichier = d["bs"].get("fichier_bs") or "—"
 
-        st.subheader("🧭 Recommandations par intérimaire")
-        reco_rows = []
-        for r in master_results:
-            best, delta, signal = recommander_statut(r["Marges"])
-            reco_rows.append({
-                "Intérimaire": r["Interimaire"],
-                "Contrat optimal": best,
-                "Marge optimale (€)": r["Marges"][best],
-                "Δ Mensualisation IFM/CP (€)": round(delta, 2),
-                "Décision IFM/CP": "Intégrer" if delta > 0 else "Séquestrer",
-            })
-        st.dataframe(pd.DataFrame(reco_rows), use_container_width=True, hide_index=True)
-        st.caption("💡 « Δ Mensualisation » = marge CTT Mensualisé − marge CTT Provision. "
-                   "Positif → intégrer les IFM/CP en cours de mois est gagnant ; "
-                   "négatif → mieux vaut les laisser en séquestre tant que la mission n'est pas soldée.")
+        key = f"brut_{nom}"
+        if key not in st.session_state:
+            st.session_state[key] = auto  # valeur initiale = détection auto
 
-        # ----------------------------------------------------------
-        # VUE DÉTAILLÉE PAR SALARIÉ
-        # ----------------------------------------------------------
-        st.header("🔎 Détail par dossier")
-        for r in master_results:
-            alerte_ocr = "⚠️ BRUT NON DÉTECTÉ SUR LE BS !" if r["BrutLu"] == 0.0 else ""
-            best, delta, signal = recommander_statut(r["Marges"])
+        c_nom, c_src, c_val = st.columns([2, 3, 2])
+        c_nom.markdown(f"**{nom}**")
+        if auto == 0.0:
+            c_src.caption(f"BS : {fichier} · ⚠️ non détecté — saisir le brut manuellement")
+        else:
+            c_src.caption(f"BS : {fichier} · auto : {methode} → {auto:.2f} €")
+        val = c_val.number_input("Brut soumis (€)", min_value=0.0, step=10.0,
+                                 key=key, label_visibility="collapsed")
+        brut_effectif[nom] = val
 
-            with st.expander(
-                f"Dossier : {r['Interimaire']} | Coef : {r['Coef']} | Heures : {r['Heures']}h "
-                f"| Optimal : {best} {alerte_ocr}",
-                expanded=True,
-            ):
-                if r["BrutLu"] == 0.0:
-                    st.error("L'outil n'a pas réussi à lire le brut sur le PDF de ce bulletin. "
-                             "Vérifiez que le document est lisible (texte, non scanné).")
+    # ----------------------------------------------------------
+    # CALCUL (avec brut éventuellement corrigé, sans muter l'auto)
+    # ----------------------------------------------------------
+    master_results = []
+    for d in dossiers:
+        nom = d["facture"]["interimaire"]
+        d_calc = {"facture": d["facture"],
+                  "bs": {**d["bs"], "total_brut": brut_effectif[nom]}}
+        master_results.append(calculer_comparatif(d_calc, is_pacte, taux_smic))
+
+    # ----------------------------------------------------------
+    # SYNTHÈSE GRAPHIQUE : choix de contrat & intégration IFM/CP
+    # ----------------------------------------------------------
+    st.header("📊 Synthèse : choix du contrat optimal")
+
+    rows = []
+    for r in master_results:
+        for statut, marge in r["Marges"].items():
+            rows.append({"Intérimaire": r["Interimaire"], "Statut": statut, "Marge (€)": marge})
+    df_graph = pd.DataFrame(rows)
+
+    couleurs = {"CTT (Provision)": "#1f77b4", "CTT (Mensualisé)": "#ff7f0e", "CDII": "#2ca02c"}
+    fig = px.bar(
+        df_graph, x="Intérimaire", y="Marge (€)", color="Statut",
+        barmode="group", color_discrete_map=couleurs, text_auto=".0f",
+        title="Marge nette comparée par statut (le plus haut = optimal)",
+    )
+    fig.update_layout(legend_title_text="Statut", yaxis_title="Marge nette (€)",
+                      xaxis_title="", uniformtext_minsize=8, uniformtext_mode="hide")
+    fig.add_hline(y=0, line_dash="dash", line_color="grey")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Totaux globaux par statut
+    totaux = df_graph.groupby("Statut")["Marge (€)"].sum()
+    c1, c2, c3 = st.columns(3)
+    for col, statut in zip((c1, c2, c3), ["CTT (Provision)", "CTT (Mensualisé)", "CDII"]):
+        col.metric(f"Total {statut}", f"{totaux.get(statut, 0):,.0f} €".replace(",", " "))
+
+    st.subheader("🧭 Recommandations par intérimaire")
+    reco_rows = []
+    for r in master_results:
+        best, delta, signal = recommander_statut(r["Marges"])
+        reco_rows.append({
+            "Intérimaire": r["Interimaire"],
+            "Contrat optimal": best,
+            "Marge optimale (€)": r["Marges"][best],
+            "Δ Mensualisation IFM/CP (€)": round(delta, 2),
+            "Décision IFM/CP": "Intégrer" if delta > 0 else "Séquestrer",
+        })
+    st.dataframe(pd.DataFrame(reco_rows), use_container_width=True, hide_index=True)
+    st.caption("💡 « Δ Mensualisation » = marge CTT Mensualisé − marge CTT Provision. "
+               "Positif → intégrer les IFM/CP en cours de mois est gagnant ; "
+               "négatif → mieux vaut les laisser en séquestre tant que la mission n'est pas soldée.")
+
+    # ----------------------------------------------------------
+    # VUE DÉTAILLÉE PAR SALARIÉ
+    # ----------------------------------------------------------
+    st.header("🔎 Détail par dossier")
+
+    def style_dataframe(row):
+        if row.name == "6. MARGE NETTE":
+            is_max, is_min = row == row.max(), row == row.min()
+            return [
+                "background-color: #d4edda; color: #155724; font-weight: bold" if v
+                else "background-color: #f8d7da; color: #721c24" if m
+                else "font-weight: bold"
+                for v, m in zip(is_max, is_min)
+            ]
+        if row.name == "3. Allègement RGDU":
+            is_worst = row == row.max()  # RGDU le moins négatif = le moins d'allègement
+            return ["color: #721c24; font-weight: bold" if w else "color: #155724" for w in is_worst]
+        return [""] * len(row)
+
+    for r in master_results:
+        alerte_ocr = "⚠️ BRUT = 0 !" if r["BrutLu"] == 0.0 else ""
+        best, delta, signal = recommander_statut(r["Marges"])
+
+        with st.expander(
+            f"Dossier : {r['Interimaire']} | Coef : {r['Coef']} | Heures : {r['Heures']}h "
+            f"| Optimal : {best} {alerte_ocr}",
+            expanded=True,
+        ):
+            if r["BrutLu"] == 0.0:
+                st.error("Brut à 0 € : la lecture automatique a échoué. "
+                         "Saisissez le brut social dans la section « Vérification du brut » ci-dessus.")
+            else:
+                st.caption(f"Brut retenu : {r['BrutLu']:.2f} € (source : {r['FichierBS']} · {r['LabelBrut']})")
+                if r["Coef"] < 1.82:
+                    st.error(f"⚠️ Alerte : coefficient bas détecté ({r['Coef']}) — seuil conseillé ≥ 1,82")
                 else:
-                    st.caption(f"Brut lu sur *{r['FichierBS']}* via le libellé « {r['LabelBrut']} » : "
-                               f"{r['BrutLu']:.2f} €")
-                    if r["Coef"] < 1.82:
-                        st.error(f"⚠️ Alerte : coefficient bas détecté ({r['Coef']}) — seuil conseillé ≥ 1,82")
-                    else:
-                        st.success(f"✅ Coefficient commercial validé : {r['Coef']}")
-                    st.info(signal)
+                    st.success(f"✅ Coefficient commercial validé : {r['Coef']}")
+                st.info(signal)
 
-                # --- AFFICHAGE OPTIONNEL DES LIGNES DE FACTURE (déployé au clic) ---
-                lignes = r["LignesRetenues"]
-                nb_retenues = sum(1 for l in lignes if l["retenue"])
-                with st.expander(
-                    f"🔍 Voir le détail de la consolidation "
-                    f"({nb_retenues} ligne(s) retenue(s) / {len(lignes)} analysée(s)) — cliquer pour déployer",
-                    expanded=False,
-                ):
-                    montrer_ignorees = st.checkbox(
-                        "Afficher aussi les lignes ignorées (autres mois)",
-                        value=False, key=f"chk_{r['Interimaire']}",
-                    )
-                    for l in lignes:
-                        if l["retenue"] or montrer_ignorees:
-                            st.caption(f"{l['statut']} · [{l['fichier']}] "
-                                       f"{l['montant']:.2f} € — {l['ligne']}")
-
-                # --- TABLEAU COMPARATIF ---
-                df = pd.DataFrame(r["Data"]).set_index("Lignes")
-
-                def style_dataframe(row):
-                    if row.name == "6. MARGE NETTE":
-                        is_max, is_min = row == row.max(), row == row.min()
-                        return [
-                            "background-color: #d4edda; color: #155724; font-weight: bold" if v
-                            else "background-color: #f8d7da; color: #721c24" if m
-                            else "font-weight: bold"
-                            for v, m in zip(is_max, is_min)
-                        ]
-                    if row.name == "3. Allègement RGDU":
-                        is_worst = row == row.max()  # RGDU le moins négatif = le moins d'allègement
-                        return ["color: #721c24; font-weight: bold" if w else "color: #155724" for w in is_worst]
-                    return [""] * len(row)
-
-                st.dataframe(
-                    df.style.format("{:.2f} €").apply(style_dataframe, axis=1),
-                    use_container_width=True,
+            # --- AFFICHAGE OPTIONNEL DES LIGNES DE FACTURE (déployé au clic) ---
+            lignes = r["LignesRetenues"]
+            nb_retenues = sum(1 for l in lignes if l["retenue"])
+            with st.expander(
+                f"🔍 Voir le détail de la consolidation "
+                f"({nb_retenues} ligne(s) retenue(s) / {len(lignes)} analysée(s)) — cliquer pour déployer",
+                expanded=False,
+            ):
+                montrer_ignorees = st.checkbox(
+                    "Afficher aussi les lignes ignorées (autres mois)",
+                    value=False, key=f"chk_{r['Interimaire']}",
                 )
+                for l in lignes:
+                    if l["retenue"] or montrer_ignorees:
+                        st.caption(f"{l['statut']} · [{l['fichier']}] "
+                                   f"{l['montant']:.2f} € — {l['ligne']}")
+
+            # --- TABLEAU COMPARATIF ---
+            df = pd.DataFrame(r["Data"]).set_index("Lignes")
+            st.dataframe(
+                df.style.format("{:.2f} €").apply(style_dataframe, axis=1),
+                use_container_width=True,
+            )
