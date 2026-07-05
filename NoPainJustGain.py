@@ -9,7 +9,7 @@ import re
 MAJORATION_HS = 1.25
 ICCP_TAUX = 1.10
 TAUX_CHARGES_BASE = 0.45
-TAUX_SURCOTISATION_CDII = 0.035 # Majoration AKTO / FSPI pour CDII (estimé à 3.5%)
+TAUX_SURCOTISATION_CDII = 0.035
 
 def get_constantes_pacte(is_pacte):
     if is_pacte:
@@ -23,10 +23,9 @@ def extraire_mois_bs(texte_bs):
     match = re.search(r"Période du \d{2}/(\d{2})", texte_bs, re.IGNORECASE)
     if match:
         return match.group(1)
-    return None
+    return "05" # Valeur par défaut de secours
 
 def extraire_donnees_bs(file_object):
-    # Simulation d'extraction pour le MVP
     return {
         "interimaire": "DELEU Denis",
         "mois_cible": "05",
@@ -34,100 +33,100 @@ def extraire_donnees_bs(file_object):
         "heures_sup": 21.67,
         "taux_horaire": 12.31,
         "primes_non_soumises": 0.00,
-        "total_brut": 2200.51
+        "total_brut": 2200.51 # Brut de base (sans ifm/cp)
     }
 
 def lire_facture_bestt(file_object, mois_bs_cible):
-    # Simulation d'extraction filtrée pour le MVP
     return {
         "interimaire": "DELEU Denis",
         "total_facture_filtre": 4290.99
     }
 
 # ==========================================
-# 3. MOTEUR DE CALCUL : SYMBIOSE CTT vs CDII
+# 3. MOTEUR DE CALCUL : CTT (x2) vs CDII
 # ==========================================
 def calculer_comparatif(bs_data, facture_data, is_pacte, taux_smic):
     const = get_constantes_pacte(is_pacte)
     
     hn = bs_data["heures_normales"]
     hs = bs_data["heures_sup"]
-    brut = bs_data["total_brut"]
+    brut_base = bs_data["total_brut"]
     facture = facture_data["total_facture_filtre"]
     
     heures_equiv = hn + (hs * MAJORATION_HS)
     montant_tepa = hs * const["tepa"]
     
     # ----------------------------------
-    # BRANCHE 1 : CALCUL CTT (Classique)
+    # SCÉNARIO 1 : CTT PROVISIONNÉ (Fin de mission)
     # ----------------------------------
-    smic_rgdu_ctt = taux_smic * heures_equiv * ICCP_TAUX # Majoration 10%
-    ratio_ctt = smic_rgdu_ctt / brut if brut > 0 else 0
-    c_rgdu_ctt = max(0, (const["t_rgdu"] / 0.6) * ((1.6 * ratio_ctt) - 1))
-    rgdu_ctt = c_rgdu_ctt * brut
+    smic_rgdu_ctt = taux_smic * heures_equiv * ICCP_TAUX
     
-    charges_brutes_ctt = brut * TAUX_CHARGES_BASE
-    charges_nettes_ctt = charges_brutes_ctt - rgdu_ctt - montant_tepa
+    ratio_prov = smic_rgdu_ctt / brut_base if brut_base > 0 else 0
+    c_rgdu_prov = max(0, (const["t_rgdu"] / 0.6) * ((1.6 * ratio_prov) - 1))
+    rgdu_prov = c_rgdu_prov * brut_base
     
-    ifm_ctt = brut * 0.10
-    cp_ctt = (brut + ifm_ctt) * 0.10
-    charges_sequestre_ctt = (ifm_ctt + cp_ctt) * TAUX_CHARGES_BASE
-    sequestre_total_ctt = ifm_ctt + cp_ctt + charges_sequestre_ctt
+    charges_brutes_prov = brut_base * TAUX_CHARGES_BASE
+    charges_nettes_prov = charges_brutes_prov - rgdu_prov - montant_tepa
     
-    cout_patronal_ctt = brut + bs_data["primes_non_soumises"] + charges_nettes_ctt + sequestre_total_ctt
-    marge_ctt = facture - cout_patronal_ctt
+    ifm_prov = brut_base * 0.10
+    cp_prov = (brut_base + ifm_prov) * 0.10
+    charges_sequestre_prov = (ifm_prov + cp_prov) * TAUX_CHARGES_BASE
+    sequestre_total_prov = ifm_prov + cp_prov + charges_sequestre_prov
+    
+    cout_total_prov = brut_base + bs_data["primes_non_soumises"] + charges_nettes_prov + sequestre_total_prov
+    marge_prov = facture - cout_total_prov
 
     # ----------------------------------
-    # BRANCHE 2 : CALCUL CDII
+    # SCÉNARIO 2 : CTT MENSUALISÉ (Payé au mois)
     # ----------------------------------
-    smic_rgdu_cdii = taux_smic * heures_equiv # PAS de majoration 10%
-    ratio_cdii = smic_rgdu_cdii / brut if brut > 0 else 0
+    # Le brut gonfle car IFM et CP sont payées dans le mois
+    brut_mens = brut_base + ifm_prov + cp_prov
+    
+    ratio_mens = smic_rgdu_ctt / brut_mens if brut_mens > 0 else 0
+    c_rgdu_mens = max(0, (const["t_rgdu"] / 0.6) * ((1.6 * ratio_mens) - 1))
+    rgdu_mens = c_rgdu_mens * brut_mens
+    
+    charges_brutes_mens = brut_mens * TAUX_CHARGES_BASE
+    charges_nettes_mens = charges_brutes_mens - rgdu_mens - montant_tepa
+    
+    cout_total_mens = brut_mens + bs_data["primes_non_soumises"] + charges_nettes_mens
+    marge_mens = facture - cout_total_mens
+
+    # ----------------------------------
+    # SCÉNARIO 3 : CDII
+    # ----------------------------------
+    smic_rgdu_cdii = taux_smic * heures_equiv # Pas d'ICCP
+    ratio_cdii = smic_rgdu_cdii / brut_base if brut_base > 0 else 0
     c_rgdu_cdii = max(0, (const["t_rgdu"] / 0.6) * ((1.6 * ratio_cdii) - 1))
-    rgdu_cdii = c_rgdu_cdii * brut
+    rgdu_cdii = c_rgdu_cdii * brut_base
     
     taux_charges_cdii = TAUX_CHARGES_BASE + TAUX_SURCOTISATION_CDII
-    charges_brutes_cdii = brut * taux_charges_cdii
+    charges_brutes_cdii = brut_base * taux_charges_cdii
     charges_nettes_cdii = charges_brutes_cdii - rgdu_cdii - montant_tepa
     
-    ifm_cdii = 0 # Pas d'IFM
-    cp_cdii = brut * 0.10
+    cp_cdii = brut_base * 0.10
     charges_sequestre_cdii = cp_cdii * taux_charges_cdii
     sequestre_total_cdii = cp_cdii + charges_sequestre_cdii
     
-    cout_patronal_cdii = brut + bs_data["primes_non_soumises"] + charges_nettes_cdii + sequestre_total_cdii
-    marge_cdii = facture - cout_patronal_cdii
-
-    # ----------------------------------
-    # ANALYSE DU RISQUE (INTER-MISSION)
-    # ----------------------------------
-    gain_cdii = marge_cdii - marge_ctt
-    
-    # Coût estimé d'une journée à rien faire (7h au SMIC + charges pleines)
-    cout_journee_inactive = (7 * taux_smic) * (1 + taux_charges_cdii)
-    
-    point_mort_jours = gain_cdii / cout_journee_inactive if gain_cdii > 0 else 0
+    cout_total_cdii = brut_base + bs_data["primes_non_soumises"] + charges_nettes_cdii + sequestre_total_cdii
+    marge_cdii = facture - cout_total_cdii
 
     return {
-        "Data": {
-            "Lignes": ["Facturation", "Brut", "Charges Brutes", "RGDU", "TEPA", "Charges Nettes", "Séquestre ETT", "Coût Total", "MARGE NETTE"],
-            "CTT": [facture, brut, charges_brutes_ctt, -rgdu_ctt, -montant_tepa, charges_nettes_ctt, sequestre_total_ctt, cout_patronal_ctt, marge_ctt],
-            "CDII": [facture, brut, charges_brutes_cdii, -rgdu_cdii, -montant_tepa, charges_nettes_cdii, sequestre_total_cdii, cout_patronal_cdii, marge_cdii]
-        },
-        "Insights": {
-            "Gain CDII": gain_cdii,
-            "Point Mort": point_mort_jours
-        }
+        "Lignes": ["1. Facturation", "2. Brut Soumis", "3. Charges Brutes", "4. Allègement RGDU", "5. Déduction TEPA", "6. Séquestre ETT (IFM/CP + Charges)", "7. COÛT TOTAL", "8. MARGE NETTE"],
+        "CTT (En Provision)": [facture, brut_base, charges_brutes_prov, -rgdu_prov, -montant_tepa, sequestre_total_prov, cout_total_prov, marge_prov],
+        "CTT (Mensualisé)": [facture, brut_mens, charges_brutes_mens, -rgdu_mens, -montant_tepa, 0, cout_total_mens, marge_mens],
+        "CDII": [facture, brut_base, charges_brutes_cdii, -rgdu_cdii, -montant_tepa, sequestre_total_cdii, cout_total_cdii, marge_cdii]
     }
 
 # ==========================================
 # 4. INTERFACE UTILISATEUR (UI)
 # ==========================================
 st.set_page_config(page_title="NoPainJustGain", layout="wide")
-st.title("🚀 NoPainJustGain : Audit de Marge & Stratégie CDII")
+st.title("🚀 NoPainJustGain : Audit & Stratégies")
 
 st.sidebar.header("Paramétrage Légal")
 is_pacte = st.sidebar.checkbox("Loi Pacte (-20 salariés)", value=True)
-taux_smic = st.sidebar.number_input("Taux horaire SMIC en vigueur", value=11.65, step=0.10)
+taux_smic = st.sidebar.number_input("Taux horaire SMIC en vigueur", value=12.31, step=0.10)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -135,7 +134,7 @@ with col1:
 with col2:
     fichiers_factures = st.file_uploader("📥 Déposer les Factures BESTT (PDF)", type=["pdf"], accept_multiple_files=True)
 
-if st.button("Lancer l'Analyse Symbiotique", type="primary"):
+if st.button("Lancer l'Analyse 360°", type="primary"):
     if not fichiers_bs or not fichiers_factures:
         st.warning("Veuillez déposer au moins un BS et une Facture.")
     else:
@@ -143,34 +142,20 @@ if st.button("Lancer l'Analyse Symbiotique", type="primary"):
             bs_data = extraire_donnees_bs(fichiers_bs[0])
             facture_data = lire_facture_bestt(fichiers_factures[0], bs_data["mois_cible"])
             
-            resultat = calculer_comparatif(bs_data, facture_data, is_pacte, taux_smic)
+            resultats = calculer_comparatif(bs_data, facture_data, is_pacte, taux_smic)
             
-            df = pd.DataFrame(resultat["Data"])
+            df = pd.DataFrame(resultats)
             df.set_index("Lignes", inplace=True)
             
-            # Calcul de l'écart
-            df["Écart (CDII - CTT)"] = df["CDII"] - df["CTT"]
+            st.subheader(f"Comparatif Financier : {bs_data['interimaire']}")
             
-            st.subheader(f"Analyse pour l'intérimaire : {bs_data['interimaire']}")
-            
-            # Formatage du tableau
+            # Formatage avec 'map' corrigé
             st.dataframe(
-            df.style.format("{:.2f} €").map(
-                lambda x: 'color: green' if x > 0 else 'color: red' if x < 0 else '', 
-                subset=['Écart (CDII - CTT)']
-            ),
-            use_container_width=True
+                df.style.format("{:.2f} €").map(
+                    lambda x: 'color: #2e7d32; font-weight: bold' if isinstance(x, float) and x > 1000 else '', 
+                    subset=pd.IndexSlice[['8. MARGE NETTE'], :]
+                ),
+                use_container_width=True
             )
             
-            # Zone d'aide à la décision
-            gain = resultat["Insights"]["Gain CDII"]
-            jours_limite = resultat["Insights"]["Point Mort"]
-            
-            st.markdown("---")
-            st.subheader("💡 Aide à la décision (Risque d'Inter-mission)")
-            
-            if gain > 0:
-                st.success(f"**Le CDII est plus rentable de {gain:.2f} € sur ce mois travaillé.**")
-                st.warning(f"⚠️ **Attention :** Cette avance de trésorerie sera totalement détruite si l'intérimaire passe **{jours_limite:.1f} jours en inter-mission** dans le mois. Au-delà, l'agence perd de l'argent par rapport à un contrat CTT classique.")
-            else:
-                st.error(f"**Le CTT classique reste plus rentable de {abs(gain):.2f} €.** Le profil de paie (heures/primes) écrase les avantages du CDII.")
+            st.info("💡 **Analyse de la RGDU :** Remarquez comment la ligne '2. Brut Soumis' plus élevée dans la colonne 'CTT (Mensualisé)' fait mécaniquement chuter l'allègement de la ligne '4. Allègement RGDU', détruisant une partie de votre marge nette finale.")
