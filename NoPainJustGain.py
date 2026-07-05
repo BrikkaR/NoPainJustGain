@@ -995,3 +995,10 @@ if "dossiers_audit" in st.session_state:
                 df.style.format("{:.2f} €").apply(style_dataframe, axis=1),
                 use_container_width=True,
             )
+            st.caption(
+                "ℹ️ **CDII** : RGDU calculé **sans majoration ICCP** (contrat CDI, pas d'ICCP) ; "
+                "surcotisation patronale +3,5 % (AKTO/FSPI) et CP payés intégrés à l'assiette soumise. "
+                "**CTT** : SMIC de référence RGDU majoré de 10 % (ICCP). "
+                "Assiette RGDU par statut — Provisionné : base ; Mensualisé : SB (IFM + CP soumis) ; "
+                "CDII : base + CP. Coefficient plafonné à T."
+            )
