@@ -59,8 +59,9 @@ _RE_DATES = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/\d{2,4})?\b")
 _RE_NON_SOUMISE = re.compile(r"PANIER|TICKET|RESTAUR|TRANSPORT|REMBOURS|D[ÉE]PLACEMENT|KILOM", re.I)
 
 def _libelle_facture(ligne):
-    """Libellé d'une ligne de facture : texte entre la parenthèse de date et le 1er nombre."""
-    m = re.search(r"\)\s*(.+?)\s+-?\d", ligne)
+    """Libellé d'une ligne de facture : texte entre la parenthèse de date et le 1er
+    nombre décimal (pas le 1er chiffre, sinon on tronque « HEURES SUPP. 25 % »)."""
+    m = re.search(r"\)\s*(.+?)\s+-?\d[\d\u00a0 ]*,\d", ligne)
     return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
 
 def mois_de_la_ligne(ligne):
@@ -290,38 +291,68 @@ def extraire_heures(texte, rows=None, defaut=151.67):
                         return val
     return defaut
 
+def _norm_libelle(s):
+    """Normalise un libellé de rubrique pour rapprocher facture et BS."""
+    s = re.sub(r"^\s*\d+\s*", "", s)              # retire le marqueur de ligne (1, 7, 2…)
+    s = re.sub(r"\s+", " ", s).strip().upper().rstrip(" .")
+    return s
+
+def _libelle_plausible(lib):
+    """Rejette les libellés parasites (texte de pied de page éclaté en lettres isolées)."""
+    toks = lib.split()
+    if not toks:
+        return False
+    isoles = sum(1 for t in toks if len(t) == 1)
+    return isoles / len(toks) <= 0.5 and bool(re.search(r"[A-ZÀ-Ÿ]{3,}", lib))
+
 def extraire_taux_bs(texte):
     """
-    Extrait les taux de référence du bulletin pour le contrôle des coefficients :
-    - taux horaire PAYÉ par type d'heure (bloc soumis à cotisations) ;
-    - coût unitaire du panier / ticket resto (bloc non soumis).
-    Retourne (dict {libellé -> taux}, cout_panier).
+    Extrait les taux unitaires PAYÉS de TOUTES les rubriques du bulletin
+    (bloc soumis + bloc non soumis), pour la réconciliation ligne à ligne BS vs Facture.
+    taux unitaire = 2e nombre de la ligne (structure : Qté, TAUX, Montant, …).
+    Retourne (dict {libellé_normalisé -> taux}, set des libellés à taux VARIABLE, cout_panier).
+    Les rubriques à taux variable (prime exceptionnelle, jours fériés à tarifs multiples)
+    sont marquées et exclues du contrôle par coefficient.
     """
     lignes = texte.split("\n")
 
-    def taux_heure(label):
-        # ligne type : "1 HEURES NORMALES 126,95h 12,0900 1 534,826 ..."
-        # -> taux = nombre placé juste après "<qté>h"
+    def zone(debut, fin):
+        cap, out = False, []
         for l in lignes:
-            if re.search(label, l, re.IGNORECASE):
-                m = re.search(r",\d+\s*h\s+(\d[\d\u00a0 ]*,\d{2,4})", l)
-                if m:
-                    return parse_montant_fr(m.group(1))
-        return None
+            if re.search(debut, l, re.IGNORECASE):
+                cap = True
+                continue
+            if cap and re.search(fin, l, re.IGNORECASE):
+                cap = False
+            if cap:
+                out.append(l)
+        return out
 
-    taux = {
-        "HEURES NORMALES": taux_heure(r"HEURES\s+NORMALES"),
-        "HEURES DIMANCHE": taux_heure(r"HEURES\s+DIMANCHE"),
-    }
+    z = (zone(r"RUBRIQUES SOUMISES", r"TOTAUX\s*:|CHARGES SOCIALES")
+         + zone(r"RUBRIQUES NON SOUMISES",
+                r"TOTAL DES RUBRIQUES NON SOUMISES|PR[ÉE]L[ÈE]VEMENT|CUMULS"))
+
+    rates, variable = {}, set()
+    for l in z:
+        m = re.search(r"^(.*?)\s+-?\d[\d\u00a0 ]*,\d", l)
+        if not m:
+            continue
+        lib = _norm_libelle(m.group(1))
+        if not lib or not _libelle_plausible(lib):
+            continue
+        nums = re.findall(_MONTANT_FR, l)
+        if len(nums) >= 2:
+            taux = parse_montant_fr(nums[1])
+            if lib in rates and abs(rates[lib] - taux) > 0.01:
+                variable.add(lib)            # même rubrique, taux différent -> variable
+            rates.setdefault(lib, taux)
 
     cout_panier = None
-    for l in lignes:
-        if re.search(r"PANIER|TICKET|RESTAUR", l, re.IGNORECASE):
-            nums = re.findall(_MONTANT_FR, l)
-            if len(nums) >= 2:                      # qté, taux, montant -> taux = 2e
-                cout_panier = parse_montant_fr(nums[1])
-                break
-    return taux, cout_panier
+    for lib, taux in rates.items():
+        if re.search(r"PANIER|TICKET|RESTAUR", lib):
+            cout_panier = taux
+            break
+    return rates, variable, cout_panier
 
 def _lire_bs(fichiers_bs):
     """
@@ -381,7 +412,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
             sb, base, methode_brut, ligne_brut, rows_diag = extraire_brut(
                 doc_cible["texte"], doc_cible["mots"])
             heures = extraire_heures(doc_cible["texte"], rows_diag)
-            taux_bs, cout_panier = extraire_taux_bs(doc_cible["texte"])
+            taux_bs, taux_variables, cout_panier = extraire_taux_bs(doc_cible["texte"])
             trouve = sb is not None
             bs_data = {
                 "brut_sb": sb if trouve else 0.0,          # brut social affiché (inclut IFM/CP)
@@ -393,7 +424,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "ligne_brut": ligne_brut,
                 "lignes_diag": rows_diag,                  # pour le panneau diagnostic
                 "statut_match": statut_match,
-                "taux_bs": taux_bs, "cout_panier": cout_panier,
+                "taux_bs": taux_bs, "taux_variables": taux_variables, "cout_panier": cout_panier,
             }
         else:
             bs_data = {
@@ -403,7 +434,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "fichier_bs": None, "label_brut": None,
                 "ligne_brut": None, "lignes_diag": [],
                 "statut_match": statut_match,   # "introuvable" ou "ambigu"
-                "taux_bs": {}, "cout_panier": None,
+                "taux_bs": {}, "taux_variables": set(), "cout_panier": None,
             }
         resultats.append({"facture": fact, "bs": bs_data})
     return resultats
@@ -500,88 +531,117 @@ def recommander_statut(marges):
 
 def controle_coefficients(dossier, tolerance=0.02):
     """
-    Contrôle de gestion des coefficients de facturation :
-    - les charges SOUMISES (heures) doivent être facturées au coefficient commercial ;
-    - les charges NON SOUMISES (panier repas / ticket resto) doivent être refacturées
-      au coefficient 1,00 (remboursement de frais à l'euro près).
-    Renvoie un dict avec le coef commercial détecté, l'analyse des lignes non soumises
-    et les alertes explicitées.
+    Réconciliation ligne à ligne BS vs Facture sur TOUTES les rubriques :
+    - charges SOUMISES (heures, primes à taux fixe) attendues au coefficient commercial ;
+    - charges NON SOUMISES (panier, ticket resto, transport) attendues au coefficient 1,00.
+    Les rubriques à taux variable (prime exceptionnelle, jours fériés multi-tarifs) sont
+    marquées « non vérifiables » et exclues du contrôle par coefficient.
+    Renvoie le coef commercial détecté, la table de réconciliation et les alertes explicitées.
     """
     lignes = [l for l in dossier["facture"]["lignes_retenues"] if l.get("retenue")]
     bs = dossier["bs"]
     taux_bs = bs.get("taux_bs") or {}
-    cout_panier = bs.get("cout_panier")
+    variables = bs.get("taux_variables") or set()
 
-    def taux_facture_pour(motif):
-        # Taux facturé DOMINANT (mode) parmi les lignes du type visé.
-        # On prend le mode et non la moyenne pour ignorer les lignes de régularisation
-        # (ex. heures normales reclassées en jour férié à 33,40 / 52,67 €).
-        vals = [round(l["taux_fact"], 2) for l in lignes
-                if l.get("taux_fact") and l["taux_fact"] > 0
-                and re.search(motif, l.get("libelle", ""), re.IGNORECASE)]
-        if not vals:
-            return None
-        freq = {}
-        for v in vals:
-            freq[v] = freq.get(v, 0) + 1
-        return max(freq, key=freq.get)   # valeur la plus fréquente
+    def taux_paye_bs(key):
+        """Taux payé BS pour une rubrique, avec tolérance OCR par mot-clé
+        (ex. facture « INDEMNITE PANIER » vs BS « I2NDEMNITE PANIER »)."""
+        if key in taux_bs:
+            return taux_bs[key], (key in variables)
+        for motcle in ("PANIER", "TICKET", "RESTAUR", "TRANSPORT"):
+            if motcle in key:
+                for bk, bv in taux_bs.items():
+                    if motcle in bk:
+                        return bv, (bk in variables)
+        return None, False
 
-    # --- Coefficient commercial (sur les heures) : HN sinon DIMANCHE ---
-    coef_commercial, base_type, tf_com, tp_com = None, None, None, None
-    for typ, motif in [("HEURES NORMALES", r"HEURES\s+NORMALES"),
-                       ("HEURES DIMANCHE", r"HEURES\s+DIMANCHE")]:
-        tf = taux_facture_pour(motif)
-        tp = taux_bs.get(typ)
-        if tf and tp:
-            coef_commercial = round(tf / tp, 3)
-            base_type, tf_com, tp_com = typ, tf, tp
-            break
+    # 1) Agrège par rubrique : taux facturé DOMINANT (mode) + qté cumulée + nature
+    agg = {}
+    for l in lignes:
+        key = _norm_libelle(l.get("libelle", ""))
+        if not key:
+            continue
+        e = agg.setdefault(key, {"freq": {}, "soumise": l.get("soumise", True),
+                                 "qte": 0.0, "libelle": l.get("libelle", "")})
+        t = round(l["taux_fact"], 2) if (l.get("taux_fact") and l["taux_fact"] > 0) else None
+        if t is not None:
+            e["freq"][t] = e["freq"].get(t, 0) + 1
+        e["qte"] += (l.get("qte") or 0)
+    for e in agg.values():
+        e["taux_fact"] = max(e["freq"], key=e["freq"].get) if e["freq"] else None
 
-    # --- Lignes NON soumises : coefficient attendu = 1,00 ---
-    lignes_ns = [l for l in lignes if not l.get("soumise")]
-    analyse_ns = []
-    ecart_total = 0.0
-    for l in lignes_ns:
-        tf = l.get("taux_fact")
-        cout = cout_panier
-        coef = round(tf / cout, 3) if (tf and cout) else None
-        qte = l.get("qte") or 0
-        ecart = (tf - cout) * qte if (tf is not None and cout is not None) else 0.0
-        ecart_total += ecart
-        analyse_ns.append({"libelle": l.get("libelle"), "taux_fact": tf,
-                           "cout": cout, "coef": coef, "qte": qte, "ecart": round(ecart, 2)})
+    # 2) Coefficient commercial = mode des coefs des lignes HEURES soumises (taux BS stable)
+    coefs_h = []
+    for key, e in agg.items():
+        if e["soumise"] and "HEURE" in key and key not in variables:
+            tp, var = taux_paye_bs(key)
+            if e["taux_fact"] and tp and not var:
+                coefs_h.append(round(e["taux_fact"] / tp, 2))
+    coef_commercial = None
+    if coefs_h:
+        f = {}
+        for c in coefs_h:
+            f[c] = f.get(c, 0) + 1
+        coef_commercial = max(f, key=f.get)
 
-    # --- Alertes ---
-    alertes = []
-    ns_hors_norme = [a for a in analyse_ns if a["coef"] is not None and abs(a["coef"] - 1.0) > tolerance]
-    if ns_hors_norme:
-        sens = "surfacturé au client" if ecart_total > 0 else "sous-facturé (perte agence)"
-        alertes.append(
-            f"Écart sur charges NON soumises : {round(ecart_total, 2):+.2f} € ({sens}). "
-            "Une indemnité de panier / ticket resto est un remboursement de frais : elle doit "
-            "être refacturée au coefficient 1,00 (à l'euro près). Un coefficient ≠ 1,00 signifie "
-            "que le coefficient commercial a été appliqué à tort à une charge non soumise.")
+    # 3) Réconciliation ligne par ligne
+    reconciliation, alertes, ecart_ns_total = [], [], 0.0
+    tf_com = tp_com = base_type = None
+    for key in sorted(agg):
+        e = agg[key]
+        tp, est_variable = taux_paye_bs(key)
+        tf, soumise = e["taux_fact"], e["soumise"]
+        attendu = 1.00 if not soumise else coef_commercial
+        coef = round(tf / tp, 3) if (tf and tp) else None
+        ecart_eur = 0.0
 
-    # Cohérence du coefficient commercial entre types d'heures (facultatif)
-    coefs_heures = []
-    for typ, motif in [("HEURES NORMALES", r"HEURES\s+NORMALES"),
-                       ("HEURES DIMANCHE", r"HEURES\s+DIMANCHE")]:
-        tf = taux_facture_pour(motif)
-        tp = taux_bs.get(typ)
-        if tf and tp:
-            coefs_heures.append(round(tf / tp, 3))
-    if len(coefs_heures) >= 2 and (max(coefs_heures) - min(coefs_heures)) > 0.05:
-        alertes.append(
-            f"Coefficient commercial incohérent entre types d'heures ({coefs_heures}) : "
-            "les heures soumises devraient toutes être facturées au même coefficient.")
+        if key == "HEURES NORMALES" and tf and tp:
+            tf_com, tp_com, base_type = tf, tp, key
+
+        if est_variable:
+            statut = "ℹ️ non vérifiable (taux variable sur le BS)"
+        elif tp is None:
+            statut = "ℹ️ rubrique facturée absente du BS (à vérifier)"
+        elif coef is None:
+            statut = "ℹ️ taux facturé indéterminé"
+        elif attendu is None:
+            statut = "ℹ️ coef commercial non déterminé"
+        elif abs(coef - attendu) <= tolerance:
+            statut = "✅ conforme"
+        else:
+            ecart_eur = round((tf - attendu * tp) * (e["qte"] or 0), 2)
+            statut = f"⚠️ coef {coef:.2f} ≠ {attendu:.2f} → {ecart_eur:+.2f} €"
+            if not soumise:
+                ecart_ns_total += ecart_eur
+            alertes.append((e["libelle"], coef, attendu, soumise, ecart_eur))
+
+        reconciliation.append({
+            "libelle": e["libelle"], "soumise": soumise, "taux_fact": tf, "taux_paye": tp,
+            "coef": coef, "attendu": attendu, "qte": round(e["qte"], 2),
+            "variable": key in variables, "statut": statut, "ecart_eur": ecart_eur,
+        })
+
+    # 4) Messages d'alerte explicités
+    messages = []
+    for lib, coef, attendu, soumise, ecart in alertes:
+        if not soumise:
+            sens = "surfacturé au client" if ecart > 0 else "sous-facturé (perte agence)"
+            messages.append(
+                f"« {lib} » (non soumise) facturée au coef {coef:.2f} au lieu de 1,00 → "
+                f"{ecart:+.2f} € ({sens}). Un remboursement de frais (panier, ticket resto, "
+                "transport) doit être refacturé à l'euro près, sans marge.")
+        else:
+            messages.append(
+                f"« {lib} » (soumise) facturée au coef {coef:.2f} alors que le coefficient "
+                f"commercial détecté est {attendu:.2f} → {ecart:+.2f} €. Toutes les heures et "
+                "primes soumises devraient suivre le même coefficient commercial.")
 
     return {
         "coef_commercial": coef_commercial,
         "base_type": base_type, "taux_fact_com": tf_com, "taux_paye_com": tp_com,
-        "cout_panier": cout_panier,
-        "analyse_ns": analyse_ns,
-        "ecart_ns_total": round(ecart_total, 2),
-        "alertes": alertes,
+        "reconciliation": reconciliation,
+        "ecart_ns_total": round(ecart_ns_total, 2),
+        "alertes": messages,
     }
 
 # ==========================================
@@ -831,35 +891,36 @@ if "dossiers_audit" in st.session_state:
                     st.success(f"✅ Coefficient commercial validé : {r['Coef']}")
                 st.info(signal)
 
-            # --- CONTRÔLE DES COEFFICIENTS DE FACTURATION ---
+            # --- CONTRÔLE DES COEFFICIENTS DE FACTURATION (réconciliation BS vs Facture) ---
             ctrl = controles_coef.get(r["Interimaire"])
-            if ctrl:
+            if ctrl and ctrl["reconciliation"]:
                 cc = ctrl["coef_commercial"]
-                if cc is not None:
-                    st.markdown(
-                        f"**Contrôle des coefficients** — commercial détecté sur les heures "
-                        f"soumises : **{cc:.2f}** "
-                        f"({ctrl['taux_fact_com']:.2f} € facturé / {ctrl['taux_paye_com']:.2f} € payé, "
-                        f"{ctrl['base_type']})")
-                # Récap des lignes non soumises (attendu : coef 1,00)
-                if ctrl["analyse_ns"]:
-                    lignes_txt = []
-                    for a in ctrl["analyse_ns"]:
-                        if a["coef"] is None:
-                            continue
-                        icone = "✅" if abs(a["coef"] - 1.0) <= 0.02 else "⚠️"
-                        lignes_txt.append(
-                            f"{icone} {a['libelle']} : facturé {a['taux_fact']:.2f} € / "
-                            f"coût {a['cout']:.2f} € → coef {a['coef']:.2f}")
-                    if lignes_txt:
-                        st.caption("Charges non soumises (remboursements, attendu coef 1,00) : "
-                                   + " · ".join(lignes_txt))
+                entete = (f"**Contrôle des coefficients (BS vs Facture)** — coef commercial "
+                          f"détecté : **{cc:.2f}**" if cc is not None
+                          else "**Contrôle des coefficients (BS vs Facture)**")
+                st.markdown(entete)
+
+                lignes_reco = []
+                for x in ctrl["reconciliation"]:
+                    lignes_reco.append({
+                        "Rubrique": x["libelle"],
+                        "Nature": "soumise" if x["soumise"] else "non soumise",
+                        "Taux facturé": f"{x['taux_fact']:.2f} €" if x["taux_fact"] else "—",
+                        "Taux payé (BS)": f"{x['taux_paye']:.2f} €" if x["taux_paye"] else "—",
+                        "Coef appliqué": f"{x['coef']:.2f}" if x["coef"] else "—",
+                        "Coef attendu": (f"{x['attendu']:.2f}" if x["attendu"] is not None else "—"),
+                        "Statut": x["statut"],
+                    })
+                st.dataframe(pd.DataFrame(lignes_reco), use_container_width=True, hide_index=True)
+
                 if ctrl["alertes"]:
                     for al in ctrl["alertes"]:
                         st.error("⚠️ " + al)
-                elif cc is not None:
-                    st.success("✅ Coefficients conformes : heures au coef commercial, "
-                               "charges non soumises (panier/ticket resto) refacturées à 1,00.")
+                else:
+                    st.success("✅ Réconciliation conforme : heures et primes soumises au coefficient "
+                               "commercial, charges non soumises (panier / ticket resto / transport) "
+                               "refacturées à 1,00. Les rubriques à taux variable ou absentes du BS "
+                               "sont signalées pour vérification manuelle.")
 
             # --- AFFICHAGE OPTIONNEL DES LIGNES DE FACTURE (déployé au clic) ---
             lignes = r["LignesRetenues"]
