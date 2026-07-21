@@ -7,15 +7,93 @@ import plotly.express as px
 # ==========================================
 # 1. PARAMÈTRES ET CONSTANTES MÉTIER
 # ==========================================
+# Majoration légale des heures supp CÔTÉ PAIE (25 %). Informative : le brut est lu
+# sur le bulletin, la majoration réellement payée y est déjà incluse (elle peut varier
+# de 110 à 120 % pour certains clients avec complément salarial). NON utilisée pour le
+# SMIC de référence de l'allègement, qui retient les heures supp à ×1,00 (art. D. 241-7).
 MAJORATION_HS = 1.25
-ICCP_TAUX = 1.10
-TAUX_CHARGES_BASE = 0.45
-TAUX_SURCOTISATION_CDII = 0.035
+TAUX_CHARGES_BASE = 0.45          # taux patronal moyen AVANT allègement (approximation paramétrable)
+TAUX_SURCOTISATION_CDII = 0.035  # surcotisation patronale CDII (AKTO/FSPI), estimation
 
-def get_constantes_pacte(is_pacte):
-    if is_pacte:
-        return {"fnal": 0.0010, "tepa": 1.50, "t_rgdu": 0.3191}
-    return {"fnal": 0.0050, "tepa": 0.50, "t_rgdu": 0.3231}
+# Majoration « caisse de congés payés » (intérim/BTP) : appliquée AU COEFFICIENT.
+# En paie c'est la « majoration de 10 % », techniquement ×100/90 (reproduit les
+# chiffres officiels type BTP). Mettre 1.10 ici pour un +10 % strict si souhaité.
+MAJORATION_ICCP = 100 / 90
+
+# --- RÉGIME PAR DATE : Fillon (< 01/01/2026) vs RGDU (>= 01/01/2026) -----------
+# RGDU 2026 (décret n°2025-887 modifié par 2025-1446 ; gel SMIC réf. par 2026-509
+# du 12/06/2026) : C = Tmin + Tdelta × [½ × (3 × SMICréf / RAB − 1)]^1,75, plafonné
+# à Tmax (= Tmin + Tdelta), plancher de 2 % jusqu'à 3 SMIC puis 0 au-delà.
+RGDU_TMIN = 0.0200
+RGDU_EXPOSANT = 1.75
+RGDU_TDELTA = {True: 0.3781, False: 0.3821}   # clé = FNAL réduit (effectif < 50)
+RGDU_TMAX = {True: 0.3981, False: 0.4021}
+RGDU_SEUIL_SORTIE = 3.0                        # sortie à 3 SMIC
+
+# SMIC de référence de l'allègement (€/h), gelé sur l'année à sa valeur du 1er janvier.
+# ⚠️ À maintenir chaque année (le SMIC change 1 à 2 fois/an ; seule la valeur du
+# 1er janvier compte pour l'allègement — la hausse de juin 2026 à 12,31 € n'est PAS
+# répercutée). Valeurs pré-2026 = SMIC applicable (Fillon n'était pas gelé).
+SMIC_REF_ANNEE = {2026: 12.02, 2025: 11.88, 2024: 11.65}
+
+# Coefficient T maximal de la réduction Fillon (pré-2026), par (année, FNAL réduit).
+# ⚠️ VALEURS À VÉRIFIER selon l'année auditée avant toute exploitation commerciale.
+T_FILLON = {
+    (2025, True): 0.3193, (2025, False): 0.3233,
+    (2024, True): 0.3194, (2024, False): 0.3234,
+    (2023, True): 0.3191, (2023, False): 0.3231,
+}
+
+def parametres_regime(annee, effectif, smic_ref_override=None, t_fillon_override=None):
+    """
+    Sélectionne le régime d'allègement selon la DATE de prestation et l'EFFECTIF.
+    - Régime : Fillon si année < 2026, RGDU si année >= 2026.
+    - Seuils d'effectif DISTINCTS : FNAL/RGDU à 50 salariés, TEPA à 20 salariés.
+    Renvoie un dict de paramètres consommé par calcul_allegement().
+    """
+    fnal_reduit = effectif < 50                     # FNAL 0,10 % (<50) sinon 0,50 %
+    tepa = 1.50 if effectif < 20 else 0.50          # déduction TEPA/h : seuil 20 salariés
+    smic_ref = smic_ref_override if smic_ref_override else SMIC_REF_ANNEE.get(annee, 12.02)
+
+    if annee >= 2026:
+        return {
+            "regime": "RGDU", "tepa": tepa, "fnal_reduit": fnal_reduit,
+            "smic_ref_horaire": smic_ref, "seuil_sortie": RGDU_SEUIL_SORTIE,
+            "tmin": RGDU_TMIN, "exposant": RGDU_EXPOSANT,
+            "tdelta": RGDU_TDELTA[fnal_reduit], "tmax": RGDU_TMAX[fnal_reduit],
+        }
+    t_max = t_fillon_override if t_fillon_override else \
+        T_FILLON.get((annee, fnal_reduit), 0.3191 if fnal_reduit else 0.3231)
+    return {
+        "regime": "Fillon", "tepa": tepa, "fnal_reduit": fnal_reduit,
+        "smic_ref_horaire": smic_ref, "seuil_sortie": 1.6, "t_max": t_max,
+    }
+
+def calcul_allegement(params, smic_ref_mois, brut_ref, majoration=1.0):
+    """
+    Montant d'allègement (Fillon ou RGDU) sur base mensuelle (proxy de l'annuel).
+    smic_ref_mois : SMIC de référence proratisé aux heures du mois.
+    majoration    : ×100/90 (caisse CP) pour les CTT ; 1.0 pour le CDII.
+    Renvoie (coefficient, montant).
+    ⚠️ Proxy MENSUEL : l'allègement légal se calcule sur la rémunération ANNUELLE
+    avec régularisation. Écart possible en intérim (contrats fragmentés), surtout
+    près du point de sortie.
+    """
+    if brut_ref <= 0:
+        return 0.0, 0.0
+    # Sortie franche : 1,6 SMIC (Fillon) ou 3 SMIC (RGDU)
+    if brut_ref >= params["seuil_sortie"] * smic_ref_mois:
+        return 0.0, 0.0
+    ratio = smic_ref_mois / brut_ref
+    if params["regime"] == "RGDU":
+        x = max(0.0, 0.5 * (3.0 * ratio - 1.0))
+        c = params["tmin"] + params["tdelta"] * (x ** params["exposant"])
+        c = min(params["tmax"], c)               # plafond Tmax (= Tmin + Tdelta)
+    else:  # Fillon
+        c = (params["t_max"] / 0.6) * ((1.6 * ratio) - 1.0)
+        c = min(params["t_max"], max(0.0, c))
+    c *= majoration                              # majoration caisse CP (coefficient)
+    return round(c, 4), c * brut_ref
 
 MOIS_LABELS = {
     "01": "Janvier", "02": "Février", "03": "Mars", "04": "Avril",
@@ -299,17 +377,29 @@ def extraire_heures(texte, rows=None, defaut=151.67):
 
 def extraire_heures_supp(texte):
     """
-    Somme des HEURES SUPPLÉMENTAIRES (lignes 'HEURES SUPP …' du bloc soumis).
-    Sert à la proratisation RGDU : SMIC_ref sur (heures normales) + (heures supp × 1,25),
-    et à la déduction TEPA (sur les heures supp uniquement).
-    On lit la quantité (nombre suivi de 'h'), pas le taux ni le montant.
+    Somme des HEURES SUPPLÉMENTAIRES. Sur le format BESTT/Talentis, ce sont les lignes
+    de MAJORATION (« MAJ HEURES SUP 25 % », « Majoration Heures supp de nuit … ») : la
+    quantité (nombre d'heures) est le 1er montant de la ligne, PAS suivi de 'h'.
+    On exclut les lignes RÉDUCTION/DÉDUCTION/COTISATION (montants, pas des heures).
+    Sert à la proratisation de l'allègement (SMIC_ref, heures supp ×1,00) et à la TEPA.
     """
     total = 0.0
     for l in texte.split("\n"):
-        if re.search(r"HEURES\s+SUPP", l, re.IGNORECASE):
-            m = re.search(r"([\d\u00a0 ]+,\d+)\s*h", l)   # qté avant le 'h'
-            if m:
-                total += parse_montant_fr(m.group(1))
+        if not re.search(r"HEURES?\s+SUP", l, re.IGNORECASE):
+            continue
+        if re.search(r"R[ÉE]DUCTION|D[ÉE]DUCTION|COTISATION", l, re.IGNORECASE):
+            continue
+        # 1) format « … 26,00 3,0775 HS … » : quantité = 1er montant, si plausible en heures
+        nums = re.findall(_MONTANT_FR, l)
+        if nums:
+            q = parse_montant_fr(nums[0])
+            if 0 < q <= 400:
+                total += q
+                continue
+        # 2) repli : ancien format « qté h »
+        m = re.search(r"([\d\u00a0 ]+,\d+)\s*h", l)
+        if m:
+            total += parse_montant_fr(m.group(1))
     return round(total, 2)
 
 def _norm_libelle(s):
@@ -375,6 +465,44 @@ def extraire_taux_bs(texte):
             break
     return rates, variable, cout_panier
 
+# Extraction des charges patronales — format BESTT/Talentis (WinDev).
+# Part patronale NETTE lue sur la ligne « TOTAUX PS <montant> PP <montant> », puis on
+# rajoute les réductions que l'outil re-simule (allègement RGDU, souvent sur 2 lignes :
+# RETRAITE + URSSAF, et déduction patronale TEPA) pour reconstituer la part patronale BRUTE.
+_RE_PP_TOTAL = re.compile(r"\bPP\s+(-?\d[\d\u00a0 .]*,\d{2})")
+_RE_ALLEGEMENT = re.compile(
+    r"RED\.?\s*G[ÉE]N|R[ÉE]DUCTION\s+G[ÉE]N|\bRGDU\b|FILLON|ALL[ÉE]GEMENT", re.I)
+_RE_TEPA_PATRONALE = re.compile(r"D[ÉE]DUCTION\s+PATRONALE", re.I)
+
+def extraire_charges_patronales(texte, rows=None):
+    """
+    Renvoie (pp_brut, pp_net, allegement_rgdu, tepa_patronale, ligne_pp, lignes_alleg).
+    pp_brut = PP net + allègement RGDU + déduction patronale TEPA (part patronale AVANT
+    réductions, que l'outil re-simule). (None, …) si la ligne PP est introuvable.
+    """
+    lignes = rows if rows else texte.split("\n")
+
+    pp_net, ligne_pp = None, None
+    for l in lignes:
+        mm = _RE_PP_TOTAL.search(l)
+        if mm:
+            pp_net, ligne_pp = parse_montant_fr(mm.group(1)), l   # dernière ligne « PP … »
+
+    allegement, tepa_pat, lignes_alleg = 0.0, 0.0, []
+    for l in lignes:
+        nums = re.findall(_MONTANT_FR, l)
+        if not nums:
+            continue
+        if _RE_TEPA_PATRONALE.search(l):                 # déduction patronale TEPA
+            tepa_pat += abs(parse_montant_fr(nums[-1])); lignes_alleg.append(l)
+        elif _RE_ALLEGEMENT.search(l):                   # allègement RGDU (1 ou 2 lignes)
+            allegement += abs(parse_montant_fr(nums[-1])); lignes_alleg.append(l)
+
+    if pp_net is None:
+        return None, None, 0.0, 0.0, None, []
+    pp_brut = pp_net + allegement + tepa_pat
+    return pp_brut, pp_net, allegement, tepa_pat, ligne_pp, lignes_alleg
+
 def _lire_bs(fichiers_bs):
     """
     Lit chaque BS en traitant CHAQUE PAGE comme un bulletin distinct
@@ -436,8 +564,21 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
             heures_supp = extraire_heures_supp(doc_cible["texte"])
             heures_normales = max(0.0, round(heures_total - heures_supp, 2))
             taux_bs, taux_variables, cout_panier = extraire_taux_bs(doc_cible["texte"])
+            pp_brut, pp_net, alleg_rgdu, tepa_pat, ligne_pp, lignes_alleg = \
+                extraire_charges_patronales(doc_cible["texte"], rows_diag)
             trouve = sb is not None
             ratio_sb_base = (sb / base) if (trouve and base and base > 0) else RATIO_SB_BASE
+            # Taux de charges BRUT (avant réductions) = part patronale brute ÷ SB (assiette
+            # réelle des cotisations sur ce format). L'allègement/TEPA sont re-simulés ensuite.
+            if pp_brut is not None and sb and sb > 0:
+                taux_charges_auto = round(pp_brut / sb, 4)
+                charges_trouve = True
+            else:
+                taux_charges_auto = TAUX_CHARGES_BASE
+                charges_trouve = False
+            # Indice « source CDII » : pas d'IFM (ratio ≈ 1,00) → la part patronale inclut
+            # déjà la contribution FSPI/formation, à ne pas re-compter en simulation.
+            source_sans_ifm = trouve and base and base > 0 and abs(ratio_sb_base - 1.0) < 0.02
             bs_data = {
                 "brut_sb": sb if trouve else 0.0,          # brut social affiché (inclut IFM/CP)
                 "total_brut": base if trouve else 0.0,     # base soumise (colonne MONTANT du BS)
@@ -452,6 +593,10 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "lignes_diag": rows_diag,                  # pour le panneau diagnostic
                 "statut_match": statut_match,
                 "taux_bs": taux_bs, "taux_variables": taux_variables, "cout_panier": cout_panier,
+                "taux_charges_auto": taux_charges_auto, "charges_trouve": charges_trouve,
+                "pp_brut_bs": pp_brut, "pp_net_bs": pp_net, "allegement_rgdu_bs": alleg_rgdu,
+                "tepa_patronale_bs": tepa_pat, "ligne_pp": ligne_pp, "lignes_alleg_bs": lignes_alleg,
+                "source_sans_ifm": source_sans_ifm,
             }
         else:
             bs_data = {
@@ -463,6 +608,10 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "ligne_brut": None, "lignes_diag": [],
                 "statut_match": statut_match,   # "introuvable" ou "ambigu"
                 "taux_bs": {}, "taux_variables": set(), "cout_panier": None,
+                "taux_charges_auto": TAUX_CHARGES_BASE, "charges_trouve": False,
+                "pp_brut_bs": None, "pp_net_bs": None, "allegement_rgdu_bs": 0.0,
+                "tepa_patronale_bs": 0.0, "ligne_pp": None, "lignes_alleg_bs": [],
+                "source_sans_ifm": False,
             }
         resultats.append({"facture": fact, "bs": bs_data})
     return resultats
@@ -470,53 +619,56 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
 # ==========================================
 # 5. MOTEUR DE CALCUL MÉTIER
 # ==========================================
-def calculer_comparatif(donnees, is_pacte, taux_smic, fspi_pct=10.0, formation_pct=0.0):
-    const = get_constantes_pacte(is_pacte)
-
+def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
+                        fspi_pct=10.0, formation_pct=0.0, taux_charges=None):
     facture = donnees["facture"]["total_facture"]
     lignes_facture = donnees["facture"]["lignes_retenues"]
     nom = donnees["facture"]["interimaire"]
 
     bs = donnees["bs"]
+    # Taux de charges patronales BRUT (avant allègement) : détecté sur le BS, corrigé
+    # à la main, ou repli sur le défaut paramétrable. L'allègement est re-simulé ensuite.
+    tx = taux_charges if taux_charges is not None else bs.get("taux_charges_auto", TAUX_CHARGES_BASE)
     brut_base = bs["total_brut"]                    # base soumise (= SB / 1,21)
     brut_sb = bs.get("brut_sb", brut_base * RATIO_SB_BASE)  # brut social affiché (inclut IFM/CP)
     coef_detecte = facture / brut_base if brut_base > 0 else 0
 
-    heures_equiv = bs["heures_normales"] + bs["heures_autres"] + (bs["heures_sup"] * MAJORATION_HS)
-    montant_tepa = bs["heures_sup"] * const["tepa"]
+    # Heures retenues pour le SMIC de référence de l'allègement : heures supp à ×1,00
+    # (art. D. 241-7 : SMIC horaire × nombre d'heures supp, SANS majoration).
+    # NB : la majoration réellement PAYÉE (125 %, ou 110-120 % selon le client) est déjà
+    # incluse dans le brut lu sur le bulletin ; elle n'intervient donc pas ici.
+    heures_ref_rgdu = bs["heures_normales"] + bs["heures_autres"] + bs["heures_sup"]
+    montant_tepa = bs["heures_sup"] * params["tepa"]
 
-    def coef_rgdu(smic_ref, brut_ref):
-        if brut_ref <= 0:
-            return 0.0
-        ratio = smic_ref / brut_ref
-        c = (const["t_rgdu"] / 0.6) * ((1.6 * ratio) - 1)
-        c = min(const["t_rgdu"], max(0.0, c))
-        return c * brut_ref
+    # SMIC de référence proratisé (heures supp ×1,00 ; pas de majoration caisse CP ici,
+    # celle-ci est portée par le COEFFICIENT, cf. calcul_allegement).
+    smic_ref_mois = params["smic_ref_horaire"] * heures_ref_rgdu
 
-    # -- CTT PROVISIONNÉ -- (SMIC majoré ICCP +10%)
-    smic_rgdu_ctt = taux_smic * heures_equiv * ICCP_TAUX
-    rgdu_prov = coef_rgdu(smic_rgdu_ctt, brut_base)
-    charges_nettes_prov = (brut_base * TAUX_CHARGES_BASE) - rgdu_prov - montant_tepa
+    def alleg(brut_ref, majoration):
+        return calcul_allegement(params, smic_ref_mois, brut_ref, majoration)[1]
+
+    # -- CTT PROVISIONNÉ -- (majoration caisse CP appliquée au coefficient)
+    rgdu_prov = alleg(brut_base, maj_iccp)
+    charges_nettes_prov = (brut_base * tx) - rgdu_prov - montant_tepa
     ifm_prov = brut_base * 0.10
     cp_prov = (brut_base + ifm_prov) * 0.10
-    sequestre_total_prov = (ifm_prov + cp_prov) * (1 + TAUX_CHARGES_BASE)
+    sequestre_total_prov = (ifm_prov + cp_prov) * (1 + tx)
     cout_total_prov = brut_base + bs["primes_non_soumises"] + charges_nettes_prov + sequestre_total_prov
     marge_prov = facture - cout_total_prov
 
-    # -- CTT MENSUALISÉ -- (IFM/CP intégrés au brut soumis)
+    # -- CTT MENSUALISÉ -- (IFM/CP intégrés au brut soumis ; majoration caisse CP)
     brut_mens = brut_base + ifm_prov + cp_prov
-    rgdu_mens = coef_rgdu(smic_rgdu_ctt, brut_mens)
-    charges_nettes_mens = (brut_mens * TAUX_CHARGES_BASE) - rgdu_mens - montant_tepa
+    rgdu_mens = alleg(brut_mens, maj_iccp)
+    charges_nettes_mens = (brut_mens * tx) - rgdu_mens - montant_tepa
     cout_total_mens = brut_mens + bs["primes_non_soumises"] + charges_nettes_mens
     marge_mens = facture - cout_total_mens
 
     # -- CDII -- (pas d'IFM ; CP PAYÉE et intégrée à l'assiette car non prise en congés ;
-    #    surcotisation patronale +3.5% AKTO/FSPI ; pas de majoration ICCP)
+    #    surcotisation patronale +3.5% AKTO/FSPI ; PAS de majoration caisse CP)
     cp_cdii = brut_base * 0.10
     brut_cdii = brut_base + cp_cdii                 # CP versée mensuellement -> soumise à cotisations
-    smic_rgdu_cdii = taux_smic * heures_equiv       # SMIC de réf NON majoré ICCP
-    rgdu_cdii = coef_rgdu(smic_rgdu_cdii, brut_cdii)
-    charges_nettes_cdii = (brut_cdii * (TAUX_CHARGES_BASE + TAUX_SURCOTISATION_CDII)) - rgdu_cdii - montant_tepa
+    rgdu_cdii = alleg(brut_cdii, 1.0)               # aucune majoration ICCP pour le CDII
+    charges_nettes_cdii = (brut_cdii * (tx + TAUX_SURCOTISATION_CDII)) - rgdu_cdii - montant_tepa
     # Contribution FSPI/AKTO : équivalent IFM (10 % du brut) affecté au fonds formation
     # (accord de branche du 10/07/2013, art. 5). Réductible par la part réellement
     # consommée en formation des intérimaires (interne/externe) ; sinon perdue.
@@ -526,13 +678,15 @@ def calculer_comparatif(donnees, is_pacte, taux_smic, fspi_pct=10.0, formation_p
 
     return {
         "Interimaire": nom,
-        "Heures": round(bs.get("heures_total", heures_equiv), 2),
-        "HeuresEquivRGDU": round(heures_equiv, 2),
+        "Heures": round(bs.get("heures_total", heures_ref_rgdu), 2),
+        "HeuresRefRGDU": round(heures_ref_rgdu, 2),
         "HeuresSupp": round(bs.get("heures_sup", 0.0), 2),
         "Coef": round(coef_detecte, 2),
         "BrutLu": brut_base,
         "BrutSB": brut_sb,
         "BrutTrouve": bs.get("brut_trouve", brut_base > 0),
+        "TauxCharges": round(tx, 4),
+        "ChargesTrouve": bs.get("charges_trouve", False),
         "FichierBS": bs.get("fichier_bs"),
         "LabelBrut": bs.get("label_brut"),
         "LigneBrut": bs.get("ligne_brut"),
@@ -543,8 +697,9 @@ def calculer_comparatif(donnees, is_pacte, taux_smic, fspi_pct=10.0, formation_p
             "CTT (Mensualisé)": round(marge_mens, 2),
             "CDII": round(marge_cdii, 2),
         },
+        "Regime": params["regime"],
         "Data": {
-            "Lignes": ["1. Facturation HT", "2. Brut Soumis", "3. Allègement RGDU",
+            "Lignes": ["1. Facturation HT", "2. Brut Soumis", f"3. Allègement {params['regime']}",
                        "4. Séquestre ETT (IFM/CP)", "4b. FSPI/AKTO formation (CDII)",
                        "5. COÛT TOTAL", "6. MARGE NETTE"],
             "CTT (Provision)": [facture, brut_base, -rgdu_prov, sequestre_total_prov, 0.00,
@@ -690,14 +845,94 @@ st.set_page_config(page_title="NoPainJustGain", layout="wide")
 st.title("🚀 NoPainJustGain : Audit de Marge Consolidé")
 
 st.sidebar.header("Paramétrage Légal")
-is_pacte = st.sidebar.checkbox("Loi Pacte (-20 salariés)", value=True)
-taux_smic = st.sidebar.number_input("Taux horaire SMIC", value=12.02, step=0.01)
+
+annee_cible = int(st.sidebar.number_input(
+    "Année de la prestation", value=2026, step=1, format="%d",
+    help="Détermine le régime d'allègement : réduction Fillon avant 2026, "
+         "RGDU à compter du 1er janvier 2026."))
+
 mois_cible = st.sidebar.selectbox(
     "Mois cible (mois du BS)",
     options=list(MOIS_LABELS.keys()),
     format_func=lambda k: f"{k} — {MOIS_LABELS[k]}",
     index=4,  # Mai par défaut
 )
+
+_EFFECTIF_MAP = {"< 20 salariés": 10, "20 à 49 salariés": 30, "≥ 50 salariés": 60}
+effectif_label = st.sidebar.radio(
+    "Effectif réel de l'entreprise", list(_EFFECTIF_MAP.keys()), index=0,
+    help="Effectif « sécurité sociale » réel (art. L.130-1 CSS). Deux seuils distincts : "
+         "FNAL/RGDU à 50 salariés (Tdelta/Tmax), TEPA à 20 salariés (1,50 € vs 0,50 €/h). "
+         "Utilisé une fois le gel Loi Pacte expiré.")
+effectif_reel = _EFFECTIF_MAP[effectif_label]
+
+# --- Gel de seuil Loi Pacte (franchissement lissé sur 5 ans, art. L.130-1 II CSS) ---
+# Un franchissement à la hausse n'a d'effet qu'après 5 années civiles consécutives :
+# les nouvelles cotisations ne s'appliquent qu'à la 6e année. Tant que le gel court,
+# on conserve le traitement d'effectif « gelé » (favorable), quel que soit l'effectif réel.
+gel_pacte = st.sidebar.checkbox(
+    "Gel de seuil Loi Pacte", value=True,
+    help="Maintient le traitement d'effectif favorable tant que le franchissement de seuil "
+         "n'est pas acquis (5 années civiles consécutives). Un franchissement à la baisse "
+         "une seule année relance le compteur de 5 ans.")
+if gel_pacte:
+    _gel_label = st.sidebar.radio(
+        "Traitement gelé (effectif de référence)", list(_EFFECTIF_MAP.keys()), index=0,
+        help="Effectif retenu pour les cotisations pendant le gel (celui d'avant "
+             "franchissement). « < 20 salariés » = FNAL 0,10 % + TEPA 1,50 €.")
+    effectif_gel = _EFFECTIF_MAP[_gel_label]
+    gel_jusqu_annee = int(st.sidebar.number_input(
+        "Gel valable jusqu'au 31/12/", value=2028, step=1, format="%d",
+        help="Dernière année civile du gel. Ex. : seuil franchi en 2024 → gelé 2024-2028, "
+             "bascule au 1er janvier 2029."))
+else:
+    effectif_gel, gel_jusqu_annee = effectif_reel, annee_cible
+
+# Effectif RETENU pour la détermination des taux (gel prioritaire tant qu'il court)
+if gel_pacte and annee_cible <= gel_jusqu_annee:
+    effectif = effectif_gel
+    _gel_actif = True
+else:
+    effectif = effectif_reel
+    _gel_actif = False
+if gel_pacte and not _gel_actif:
+    st.sidebar.warning(f"⚠️ Gel Loi Pacte expiré au 31/12/{gel_jusqu_annee} : "
+                       f"l'effectif réel ({effectif_label}) s'applique pour {annee_cible}.")
+
+_smic_ref_defaut = SMIC_REF_ANNEE.get(annee_cible, 12.02)
+smic_reference = st.sidebar.number_input(
+    "SMIC de référence allègement (€/h)", value=_smic_ref_defaut, step=0.01,
+    help="Valeur AU 1er JANVIER, gelée sur l'année. 12,02 € pour 2026 : la hausse "
+         "de juin 2026 à 12,31 € n'est PAS répercutée sur l'allègement. À mettre à "
+         "jour chaque année (le SMIC change 1 à 2 fois/an).")
+
+maj_iccp = st.sidebar.number_input(
+    "Majoration caisse CP intérim (× coefficient)", value=MAJORATION_ICCP,
+    step=0.001, format="%.4f",
+    help="Majoration « caisse de congés payés » appliquée AU COEFFICIENT pour les CTT "
+         "(pas au CDII). 1,1111 (=100/90) = la « majoration de 10 % » au sens paie, "
+         "qui reproduit les chiffres officiels. Mettre 1,1000 pour un +10 % strict.")
+
+taux_charges_defaut = st.sidebar.number_input(
+    "Taux de charges patronales par défaut (%)", value=TAUX_CHARGES_BASE * 100,
+    step=0.5, min_value=0.0, max_value=100.0,
+    help="Repli quand le taux réel n'est pas détecté sur le bulletin. Taux patronal BRUT "
+         "(avant allègement) ; l'allègement est re-simulé par l'outil.") / 100.0
+
+# Coefficient T de la réduction Fillon éditable uniquement en régime pré-2026
+_t_fillon_override = None
+if annee_cible < 2026:
+    _fnal_reduit = effectif < 50
+    _t_def = T_FILLON.get((annee_cible, _fnal_reduit), 0.3191 if _fnal_reduit else 0.3231)
+    _t_fillon_override = st.sidebar.number_input(
+        f"Coefficient T Fillon {annee_cible} (FNAL {'0,10' if _fnal_reduit else '0,50'} %)",
+        value=_t_def, step=0.0001, format="%.4f",
+        help="⚠️ Vérifier la valeur officielle du T pour l'année auditée.")
+
+# Régime + paramètres consolidés (indépendants de l'intérimaire)
+params_regime = parametres_regime(annee_cible, effectif,
+                                  smic_ref_override=smic_reference,
+                                  t_fillon_override=_t_fillon_override)
 
 st.sidebar.header("CDI Intérimaire (CDII)")
 fspi_pct = st.sidebar.number_input(
@@ -733,6 +968,7 @@ if st.button("Lancer l'Audit Automatique", type="primary"):
         # les corrections manuelles éventuelles d'un audit précédent.
         st.session_state["dossiers_audit"] = dossiers_complets
         st.session_state["mois_audit"] = mois_cible
+        st.session_state["annee_audit"] = annee_cible
         for k in [k for k in st.session_state.keys() if k.startswith("brut_")]:
             del st.session_state[k]
 
@@ -742,9 +978,14 @@ if st.button("Lancer l'Audit Automatique", type="primary"):
 if "dossiers_audit" in st.session_state:
     dossiers = st.session_state["dossiers_audit"]
     mois_audit = st.session_state.get("mois_audit", mois_cible)
+    annee_audit = st.session_state.get("annee_audit", annee_cible)
 
-    st.success(f"Audit — mois {mois_audit} ({MOIS_LABELS[mois_audit]}). "
-               "Rapprochement Factures / BS effectué.")
+    st.success(f"Audit — {MOIS_LABELS[mois_audit]} {annee_audit} · "
+               f"régime **{params_regime['regime']}** "
+               f"(FNAL {'0,10' if params_regime['fnal_reduit'] else '0,50'} %, "
+               f"TEPA {params_regime['tepa']:.2f} €/h, SMIC réf. {params_regime['smic_ref_horaire']:.2f} €/h)"
+               + (f" · 🔒 gel Loi Pacte actif (jusqu'au 31/12/{gel_jusqu_annee})" if _gel_actif else "")
+               + ". Rapprochement Factures / BS effectué.")
 
     # ----------------------------------------------------------
     # VÉRIFICATION / CORRECTION MANUELLE DU BRUT (garde-fou)
@@ -815,6 +1056,65 @@ if "dossiers_audit" in st.session_state:
                     st.markdown(f"{marqueur}`{ligne}`  —  montants : {', '.join(montants)}")
 
     # ----------------------------------------------------------
+    # VÉRIFICATION / CORRECTION DU TAUX DE CHARGES PATRONALES
+    # ----------------------------------------------------------
+    st.header("🏛️ Taux de charges patronales (par dossier)")
+
+    # Socle CTT = médiane des taux détectés sur les bulletins CTT (avec IFM/CP) du lot.
+    # Sert de repli pour les bulletins CDII (taux « pollué » par le FSPI/formation que
+    # l'outil re-simule) et pour les dossiers non détectés. Robuste aux valeurs aberrantes.
+    _taux_ctt = [float(d["bs"]["taux_charges_auto"]) for d in dossiers
+                 if d["bs"].get("charges_trouve") and not d["bs"].get("source_sans_ifm")]
+    if _taux_ctt:
+        _s = sorted(_taux_ctt); _n = len(_s)
+        socle_ctt = round(_s[_n // 2] if _n % 2 else (_s[_n // 2 - 1] + _s[_n // 2]) / 2, 4)
+    else:
+        socle_ctt = taux_charges_defaut
+
+    st.caption(f"Taux patronal **brut, AVANT réductions** = (PP net + allègement RGDU + TEPA) ÷ SB, "
+               f"lu par dossier. Pour un CTT : son taux propre. Pour un CDII (sans IFM, taux gonflé "
+               f"par le FSPI/formation que l'outil re-simule) ou un dossier non détecté : repli sur le "
+               f"**socle CTT du lot = {socle_ctt * 100:.2f} %** (médiane des CTT). "
+               "Tout reste corrigeable ci-dessous.")
+
+    taux_charges_effectif = {}
+    for d in dossiers:
+        nom = d["facture"]["interimaire"]
+        bs = d["bs"]
+        trouve_ch = bs.get("charges_trouve", False)
+        cdii_src = bs.get("source_sans_ifm", False)
+        # CTT détecté → taux propre ; CDII ou non détecté → socle CTT du lot.
+        if trouve_ch and not cdii_src:
+            auto_tx = float(bs.get("taux_charges_auto"))
+        else:
+            auto_tx = socle_ctt
+
+        key = f"txch_{nom}"
+        if key not in st.session_state:
+            st.session_state[key] = round(auto_tx * 100, 2)   # en %
+
+        c_nom, c_src, c_val = st.columns([2, 3, 2])
+        c_nom.markdown(f"**{nom}**")
+        if trouve_ch:
+            ppn = bs.get("pp_net_bs") or 0.0
+            rg = bs.get("allegement_rgdu_bs") or 0.0
+            tp = bs.get("tepa_patronale_bs") or 0.0
+            own_tx = float(bs.get("taux_charges_auto"))
+            c_src.caption(f"✅ détecté : PP net {ppn:.2f} € + RGDU {rg:.2f} € + TEPA {tp:.2f} € "
+                          f"÷ SB → **{own_tx * 100:.2f} %** (brut, avant réductions)")
+            if cdii_src:
+                c_src.caption(f"⚠️ Bulletin **sans IFM (CDII)** — taux propre {own_tx * 100:.2f} % "
+                              "gonflé par le FSPI/formation. **Socle CTT du lot appliqué** "
+                              f"({socle_ctt * 100:.2f} %) pour rester comparable ; le FSPI est "
+                              "re-simulé séparément. Corrigeable à droite.")
+        else:
+            c_src.caption(f"🔴 non détecté sur le BS — **socle CTT du lot appliqué** "
+                          f"({socle_ctt * 100:.2f} %). Vérifier/saisir à droite.")
+        tx_val = c_val.number_input("Taux charges (%)", min_value=0.0, max_value=100.0,
+                                    step=0.5, key=key, label_visibility="collapsed")
+        taux_charges_effectif[nom] = tx_val / 100.0
+
+    # ----------------------------------------------------------
     # CALCUL (avec brut éventuellement corrigé, sans muter l'auto)
     # ----------------------------------------------------------
     master_results = []
@@ -826,8 +1126,9 @@ if "dossiers_audit" in st.session_state:
                   "bs": {**d["bs"],
                          "brut_sb": sb,
                          "total_brut": sb / ratio}}  # base = SB ÷ ratio réel (1,21, ou 1,10 si IFM/CP seul)
-        master_results.append(calculer_comparatif(d_calc, is_pacte, taux_smic,
-                                                  fspi_pct=fspi_pct, formation_pct=formation_pct))
+        master_results.append(calculer_comparatif(d_calc, params_regime, maj_iccp=maj_iccp,
+                                                  fspi_pct=fspi_pct, formation_pct=formation_pct,
+                                                  taux_charges=taux_charges_effectif[nom]))
 
     # Contrôle des coefficients de facturation (soumises vs non soumises), par intérimaire
     controles_coef = {d["facture"]["interimaire"]: controle_coefficients(d) for d in dossiers}
@@ -945,8 +1246,13 @@ if "dossiers_audit" in st.session_state:
                            f"{r['BrutLu']:.2f} € · ratio SB/base = {_ratio:.2f} ({_struct}) · "
                            f"source : {r['FichierBS']} · {r['LabelBrut']}")
                 st.caption(f"⏱️ Heures : {r['Heures']:.2f} h travaillées dont {r['HeuresSupp']:.2f} h supp "
-                           f"→ base RGDU = {r['HeuresEquivRGDU']:.2f} h équivalentes "
-                           "(normales + supp × 1,25). Les heures supp basculent sous TEPA.")
+                           f"→ SMIC de réf. proratisé sur {r['HeuresRefRGDU']:.2f} h "
+                           "(normales + supp × 1,00, art. D. 241-7). La majoration payée (125 % ou "
+                           "110-120 % selon le client) est déjà dans le brut lu. Les heures supp basculent sous TEPA.")
+                st.caption(f"🏛️ Taux de charges patronales retenu : **{r['TauxCharges'] * 100:.2f} %** "
+                           + ("(détecté sur le BS)" if r.get("ChargesTrouve")
+                              else "(défaut/saisie manuelle — non détecté sur le BS)")
+                           + f". Surcotisation CDII +{TAUX_SURCOTISATION_CDII * 100:.1f} % en sus.")
                 st.caption(f"📊 Coefficient de rentabilité global : **{r['Coef']}** "
                            "(Facture mai ÷ base soumise). Indicateur global, dilué par les postes "
                            "refacturés hors marge (panier à 1,00, primes exceptionnelles à prix coûtant) "
@@ -1022,9 +1328,11 @@ if "dossiers_audit" in st.session_state:
                 use_container_width=True,
             )
             st.caption(
-                "ℹ️ **CDII** : RGDU calculé **sans majoration ICCP** (contrat CDI, pas d'ICCP) ; "
-                "surcotisation patronale +3,5 % (AKTO/FSPI) et CP payés intégrés à l'assiette soumise. "
-                "**CTT** : SMIC de référence RGDU majoré de 10 % (ICCP). "
-                "Assiette RGDU par statut — Provisionné : base ; Mensualisé : SB (IFM + CP soumis) ; "
-                "CDII : base + CP. Coefficient plafonné à T."
+                f"ℹ️ Allègement calculé en régime **{r.get('Regime', '—')}** "
+                f"(Fillon avant 2026, RGDU à partir de 2026). "
+                "**CTT** : majoration caisse de congés payés appliquée **au coefficient** "
+                f"(×{maj_iccp:.4f}). **CDII** : **aucune** majoration (contrat CDI) ; "
+                "surcotisation patronale +3,5 % (AKTO/FSPI) et CP payés intégrés à l'assiette. "
+                "Assiette par statut — Provisionné : base ; Mensualisé : SB (IFM + CP soumis) ; "
+                "CDII : base + CP. Coefficient plafonné à Tmax ; plancher 2 % puis 0 au-delà de 3 SMIC (RGDU)."
             )
