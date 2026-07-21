@@ -185,19 +185,27 @@ def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
             # sinon le total diverge du total imprimé sur la facture.
             a_total = "=" in ligne
             montants = _tous_les_montants(ligne)
-            montant = montants[-1] if (a_total and montants) else 0.0
+            # Montant facturé = 1er montant APRÈS le dernier « = » (et non le dernier
+            # nombre de la ligne : le format Puget ajoute une colonne « Coef » 1,9000
+            # en fin de ligne qui serait sinon prise pour le total).
+            montant = 0.0
+            if a_total:
+                apres_egal = ligne.rsplit("=", 1)[1]
+                ms_ap = _tous_les_montants(apres_egal)
+                montant = ms_ap[0] if ms_ap else 0.0
             retenue = (mois_attr == mois_cible) and a_total
 
-            # Métadonnées pour le contrôle des coefficients de facturation
+            # Métadonnées pour le contrôle des coefficients de facturation.
             libelle = _libelle_facture(ligne)
-            qte = montants[0] if montants else None
-            # taux facturé unitaire = montant / qté (robuste), sinon 2e nombre de la ligne
-            if qte not in (None, 0) and a_total:
+            # Qté et taux facturé via l'ancre « <qté> x <taux> » (robuste aux deux
+            # formats : Nice « 13,50 x 23,75 € », Puget « 12,50 € 14,00 x 23,750 € »).
+            qte = taux_fact = None
+            mx = re.search(r"(-?\d[\d\u00a0 .]*,\d+)\s*[x×]\s*(-?\d[\d\u00a0 .]*,\d+)", ligne)
+            if mx:
+                qte = parse_montant_fr(mx.group(1))
+                taux_fact = parse_montant_fr(mx.group(2))
+            elif qte not in (None, 0) and a_total and montant:
                 taux_fact = round(montant / qte, 4)
-            elif len(montants) >= 3:
-                taux_fact = montants[1]
-            else:
-                taux_fact = None
             soumise = not bool(_RE_NON_SOUMISE.search(libelle))
 
             if not a_total:
@@ -503,6 +511,36 @@ def extraire_charges_patronales(texte, rows=None):
     pp_brut = pp_net + allegement + tepa_pat
     return pp_brut, pp_net, allegement, tepa_pat, ligne_pp, lignes_alleg
 
+# Mois de la PÉRIODE du bulletin (pour vérifier la cohérence avec le mois cible des factures).
+_RE_PERIODE_BS = re.compile(
+    r"[Pp]aie\s+du\s+\d{1,2}/\d{1,2}/\d{2,4}\s+au\s+\d{1,2}/(\d{1,2})/\d{2,4}")
+_RE_BULLETIN_DU = re.compile(r"BULLETIN\s+DE\s+PAIE\s+DU\s+\d{1,2}/(\d{1,2})/\d{2,4}", re.I)
+
+def mois_du_bs(texte):
+    """Renvoie le mois ('06') de la période de paie du bulletin, ou None."""
+    for rx in (_RE_PERIODE_BS, _RE_BULLETIN_DU):
+        m = rx.search(texte)
+        if m:
+            return m.group(1).zfill(2)
+    return None
+
+def detecter_mois_lot_bs(fichiers_bs):
+    """
+    Détecte le mois DOMINANT des bulletins déposés (lecture rapide de chaque page),
+    pour piloter automatiquement la consolidation des factures sur le bon mois.
+    Renvoie (mois_dominant | None, dict {mois: nb_pages}).
+    """
+    freq = {}
+    for f in fichiers_bs:
+        with pdfplumber.open(f) as pdf:
+            for p in pdf.pages:
+                mm = mois_du_bs(p.extract_text() or "")
+                if mm:
+                    freq[mm] = freq.get(mm, 0) + 1
+    if not freq:
+        return None, {}
+    return max(freq, key=freq.get), freq
+
 def _lire_bs(fichiers_bs):
     """
     Lit chaque BS en traitant CHAQUE PAGE comme un bulletin distinct
@@ -579,6 +617,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
             # Indice « source CDII » : pas d'IFM (ratio ≈ 1,00) → la part patronale inclut
             # déjà la contribution FSPI/formation, à ne pas re-compter en simulation.
             source_sans_ifm = trouve and base and base > 0 and abs(ratio_sb_base - 1.0) < 0.02
+            mois_bs = mois_du_bs(doc_cible["texte"])
             bs_data = {
                 "brut_sb": sb if trouve else 0.0,          # brut social affiché (inclut IFM/CP)
                 "total_brut": base if trouve else 0.0,     # base soumise (colonne MONTANT du BS)
@@ -596,7 +635,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "taux_charges_auto": taux_charges_auto, "charges_trouve": charges_trouve,
                 "pp_brut_bs": pp_brut, "pp_net_bs": pp_net, "allegement_rgdu_bs": alleg_rgdu,
                 "tepa_patronale_bs": tepa_pat, "ligne_pp": ligne_pp, "lignes_alleg_bs": lignes_alleg,
-                "source_sans_ifm": source_sans_ifm,
+                "source_sans_ifm": source_sans_ifm, "mois_bs": mois_bs,
             }
         else:
             bs_data = {
@@ -611,7 +650,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "taux_charges_auto": TAUX_CHARGES_BASE, "charges_trouve": False,
                 "pp_brut_bs": None, "pp_net_bs": None, "allegement_rgdu_bs": 0.0,
                 "tepa_patronale_bs": 0.0, "ligne_pp": None, "lignes_alleg_bs": [],
-                "source_sans_ifm": False,
+                "source_sans_ifm": False, "mois_bs": None,
             }
         resultats.append({"facture": fact, "bs": bs_data})
     return resultats
@@ -955,19 +994,29 @@ if st.button("Lancer l'Audit Automatique", type="primary"):
     if not fichiers_factures or not fichiers_bs:
         st.warning("Veuillez déposer à la fois les Factures ET les Bulletins de Salaire.")
     else:
-        with st.spinner("Consolidation des factures et lecture des BS en cours..."):
-            factures_consolidees = lire_factures_bestt_consolidees(fichiers_factures, mois_cible=mois_cible)
+        with st.spinner("Détection du mois des bulletins, consolidation des factures et lecture des BS..."):
+            # Le mois des BULLETINS fait autorité : on consolide les factures sur CE mois,
+            # pour ne plus jamais comparer la facturation d'un mois au brut d'un autre.
+            mois_bs_lot, _freq_mois = detecter_mois_lot_bs(fichiers_bs)
+            mois_effectif = mois_bs_lot or mois_cible
+            factures_consolidees = lire_factures_bestt_consolidees(fichiers_factures, mois_cible=mois_effectif)
             dossiers_complets = extraire_et_associer_bs(fichiers_bs, factures_consolidees)
 
+        if mois_bs_lot and mois_bs_lot != mois_cible:
+            st.info(f"📅 Mois détecté sur les bulletins : **{MOIS_LABELS[mois_bs_lot]}**. "
+                    f"Les factures ont été consolidées sur **{MOIS_LABELS[mois_bs_lot]}** "
+                    f"(le sélecteur était sur {MOIS_LABELS[mois_cible]}). "
+                    "Pour auditer un autre mois, déposez les bulletins de ce mois-là.")
+
         if not dossiers_complets:
-            st.error("Aucun intérimaire n'a pu être consolidé sur le mois cible. "
-                     "Vérifiez le mois sélectionné et le format des factures.")
+            st.error(f"Aucun intérimaire n'a pu être consolidé sur {MOIS_LABELS.get(mois_effectif, mois_effectif)}. "
+                     "Vérifiez que les factures couvrent bien le mois des bulletins.")
             st.stop()
 
         # On mémorise les données BRUTES extraites (brut auto inclus) et on réinitialise
         # les corrections manuelles éventuelles d'un audit précédent.
         st.session_state["dossiers_audit"] = dossiers_complets
-        st.session_state["mois_audit"] = mois_cible
+        st.session_state["mois_audit"] = mois_effectif
         st.session_state["annee_audit"] = annee_cible
         for k in [k for k in st.session_state.keys() if k.startswith("brut_")]:
             del st.session_state[k]
@@ -986,6 +1035,24 @@ if "dossiers_audit" in st.session_state:
                f"TEPA {params_regime['tepa']:.2f} €/h, SMIC réf. {params_regime['smic_ref_horaire']:.2f} €/h)"
                + (f" · 🔒 gel Loi Pacte actif (jusqu'au 31/12/{gel_jusqu_annee})" if _gel_actif else "")
                + ". Rapprochement Factures / BS effectué.")
+
+    # --- GARDE-FOU : cohérence entre le mois cible (factures) et le mois des bulletins ---
+    _mois_bs = [d["bs"].get("mois_bs") for d in dossiers if d["bs"].get("mois_bs")]
+    if _mois_bs:
+        _freq = {}
+        for mm in _mois_bs:
+            _freq[mm] = _freq.get(mm, 0) + 1
+        _mois_bs_dominant = max(_freq, key=_freq.get)
+        if _mois_bs_dominant != mois_audit:
+            st.error(
+                f"⛔ **Décalage de période détecté.** Les bulletins portent sur le mois "
+                f"**{_mois_bs_dominant} ({MOIS_LABELS[_mois_bs_dominant]})**, mais le mois cible des "
+                f"factures est **{mois_audit} ({MOIS_LABELS[mois_audit]})**. L'outil compare alors la "
+                f"facturation d'un mois au brut d'un autre → marges fausses (souvent négatives). "
+                f"Corrige le **« Mois cible »** dans la barre latérale sur "
+                f"**{_mois_bs_dominant} — {MOIS_LABELS[_mois_bs_dominant]}** et relance l'audit.")
+        else:
+            st.caption(f"✅ Cohérence période : factures et bulletins sur {MOIS_LABELS[mois_audit]}.")
 
     # ----------------------------------------------------------
     # VÉRIFICATION / CORRECTION MANUELLE DU BRUT (garde-fou)
