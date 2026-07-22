@@ -1404,7 +1404,7 @@ if "dossiers_audit" in st.session_state:
             rows.append({"Intérimaire": r["Interimaire"], "Statut": libelle, "Marge (€)": marge})
     df_graph = pd.DataFrame(rows)
 
-    couleurs = {"CTT Provision (trésorerie)": "#9ecae1", "CTT (Mensualisé)": "#ff7f0e", "CDII": "#2ca02c"}
+    couleurs = {"CTT Provision (trésorerie)": "#c7c7c7", "CTT (Mensualisé)": "#ff7f0e", "CDII": "#1f77b4"}
     fig = px.bar(
         df_graph, x="Intérimaire", y="Marge (€)", color="Statut",
         barmode="group", color_discrete_map=couleurs, text_auto=".0f",
@@ -1451,7 +1451,7 @@ if "dossiers_audit" in st.session_state:
         a = analyser_choix_contrat(r, fspi_pct, formation_pct, cout_intermission)
         reco_rows.append({
             "Intérimaire": r["Interimaire"],
-            "Contrat recommandé": "🟢 CDII" if a["recommande"] == "CDII" else "🔵 CTT",
+            "Contrat recommandé": "🔵 CDII" if a["recommande"] == "CDII" else "🟠 CTT",
             "Marge CDII nette (€)": a["cdii_net"],
             "Marge CTT réelle (€)": a["ctt_reel"],
             "Écart CDII − CTT (€)": a["delta"],
@@ -1586,16 +1586,16 @@ if "dossiers_audit" in st.session_state:
 
                 # --- RECOMMANDATION DE CONTRAT (le cœur de la décision) ---
                 if analyse["recommande"] == "CDII":
-                    msg = (f"🟢 **CDII recommandé** : marge {analyse['cdii_net']:.0f} € "
+                    msg = (f"🔵 **CDII recommandé** : marge {analyse['cdii_net']:.0f} € "
                            f"vs {analyse['ctt_reel']:.0f} € en CTT (**{analyse['delta']:+.0f} €/mois**).")
                     if analyse["raisons"]:
                         msg += " Pourquoi : " + " ; ".join(analyse["raisons"]) + "."
-                    st.success(msg)
+                    st.info(msg)
                     if analyse["levier_formation"] > 0.5:
-                        st.info(f"⚡ Levier : documenter la formation interne récupérerait jusqu'à "
-                                f"**+{analyse['levier_formation']:.0f} €/mois** de FSPI aujourd'hui perdue.")
+                        st.success(f"⚡ Levier : documenter la formation interne récupérerait jusqu'à "
+                                   f"**+{analyse['levier_formation']:.0f} €/mois** de FSPI aujourd'hui perdue.")
                 else:
-                    msg = (f"🔵 **CTT recommandé** : marge {analyse['ctt_reel']:.0f} € "
+                    msg = (f"🟠 **CTT recommandé** : marge {analyse['ctt_reel']:.0f} € "
                            f"vs {analyse['cdii_net']:.0f} € en CDII ({analyse['delta']:+.0f} €/mois).")
                     if analyse["raisons"]:
                         msg += " Pourquoi : " + " ; ".join(analyse["raisons"]) + "."
