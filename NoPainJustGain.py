@@ -750,17 +750,53 @@ def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
         },
     }
 
-def recommander_statut(marges):
-    """Détermine le statut optimal + le signal d'intégration IFM/CP en cours de mois."""
-    best = max(marges, key=marges.get)
-    delta_integration = marges["CTT (Mensualisé)"] - marges["CTT (Provision)"]
-    if delta_integration > 0:
-        signal_ifm = ("✅ Intégrer les IFM/CP dès maintenant : la mensualisation améliore "
-                      f"la marge de {delta_integration:+.2f} € (allègement RGDU plus favorable).")
+def analyser_choix_contrat(r, fspi_pct=10.0, formation_pct=0.0, cout_intermission=0.0):
+    """
+    Décide le contrat le plus RENTABLE et EXPLIQUE pourquoi.
+
+    Principe : le CTT Provisionné n'est PAS un choix de marge. Après la régularisation
+    progressive (obligatoire, mensuelle sur le cumul), il donne la MÊME marge que le
+    Mensualisé sur la mission — seule la trésorerie diffère. On retient donc le Mensualisé
+    comme marge CTT réelle, et le vrai arbitrage est CDII vs CTT, en tenant compte de la
+    formation réellement documentée (récupération FSPI) et d'un éventuel coût d'intermission.
+    Renvoie un dict complet pour l'affichage.
+    """
+    base = r["BrutLu"]
+    ctt_reel = r["Marges"]["CTT (Mensualisé)"]
+    cdii_net = r["Marges"]["CDII"] - cout_intermission
+    delta = round(cdii_net - ctt_reel, 2)
+    recommande = "CDII" if delta > 0 else "CTT"
+
+    economie_ifm = base * 0.10                                   # IFM non versée en CDII
+    fspi_plein = base * (fspi_pct / 100.0)                       # contribution FSPI totale
+    fspi_perdue = fspi_plein * (1 - formation_pct / 100.0)       # part encore perdue (récupérable)
+    delta_tresorerie = round(r["Marges"]["CTT (Provision)"] - ctt_reel, 2)  # gain mensuel de float
+
+    raisons = []
+    if recommande == "CDII":
+        raisons.append(f"pas d'IFM : économie de {economie_ifm:.0f} € de brut (+ ses charges) "
+                       "que le CTT verse en fin de mission")
+        if formation_pct >= 100:
+            raisons.append(f"FSPI ({fspi_plein:.0f} €) intégralement récupérée en formation")
+        elif fspi_perdue > 0:
+            raisons.append(f"reste {fspi_perdue:.0f} €/mois de FSPI encore récupérables "
+                           "si tu documentes davantage de formation interne")
     else:
-        signal_ifm = ("🔒 Laisser les IFM/CP en séquestre : la mensualisation coûterait "
-                      f"{delta_integration:+.2f} € de marge tant que la mission n'est pas terminée.")
-    return best, delta_integration, signal_ifm
+        if cout_intermission > 0:
+            raisons.append(f"le coût d'intermission ({cout_intermission:.0f} €/mois) dépasse "
+                           "l'économie d'IFM du CDII")
+        if fspi_perdue > 0:
+            raisons.append(f"la FSPI non documentée ({fspi_perdue:.0f} €/mois) est perdue — "
+                           "la documenter ferait probablement basculer en faveur du CDII")
+
+    levier = fspi_perdue if fspi_perdue > 0.5 else 0.0
+    return {
+        "recommande": recommande, "delta": delta,
+        "cdii_net": round(cdii_net, 2), "ctt_reel": round(ctt_reel, 2),
+        "economie_ifm": round(economie_ifm, 2), "fspi_plein": round(fspi_plein, 2),
+        "fspi_perdue": round(fspi_perdue, 2), "levier_formation": round(levier, 2),
+        "delta_tresorerie": delta_tresorerie, "raisons": raisons,
+    }
 
 def controle_coefficients(dossier, tolerance=0.02):
     """
@@ -983,6 +1019,11 @@ formation_pct = st.sidebar.slider(
     help="Fraction des 10 % FSPI réellement consommée en formation des intérimaires "
          "(interne/externe). 0 % = rien n'est formé → contribution perdue. "
          "100 % = intégralement récupérée en actions de formation.")
+cout_intermission = st.sidebar.number_input(
+    "Coût d'intermission CDII (€/mois/intérimaire)", value=0.0, step=50.0, min_value=0.0,
+    help="Seul vrai risque du CDII : la garantie de rémunération versée ENTRE deux missions. "
+         "Coût mensuel moyen estimé par intérimaire. 0 € si vos profils sont placés en continu "
+         "(pas d'intermission).")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -1208,46 +1249,77 @@ if "dossiers_audit" in st.session_state:
     rows = []
     for r in master_results:
         for statut, marge in r["Marges"].items():
-            rows.append({"Intérimaire": r["Interimaire"], "Statut": statut, "Marge (€)": marge})
+            libelle = "CTT Provision (trésorerie)" if statut == "CTT (Provision)" else statut
+            rows.append({"Intérimaire": r["Interimaire"], "Statut": libelle, "Marge (€)": marge})
     df_graph = pd.DataFrame(rows)
 
-    couleurs = {"CTT (Provision)": "#1f77b4", "CTT (Mensualisé)": "#ff7f0e", "CDII": "#2ca02c"}
+    couleurs = {"CTT Provision (trésorerie)": "#9ecae1", "CTT (Mensualisé)": "#ff7f0e", "CDII": "#2ca02c"}
     fig = px.bar(
         df_graph, x="Intérimaire", y="Marge (€)", color="Statut",
         barmode="group", color_discrete_map=couleurs, text_auto=".0f",
-        title="Marge nette comparée par statut (le plus haut = optimal)",
+        title="Marge nette par statut — CTT réel = Mensualisé, arbitrage CDII vs CTT",
     )
     fig.update_layout(legend_title_text="Statut", yaxis_title="Marge nette (€)",
                       xaxis_title="", uniformtext_minsize=8, uniformtext_mode="hide")
     fig.add_hline(y=0, line_dash="dash", line_color="grey")
     st.plotly_chart(fig, use_container_width=True)
+    st.caption("⚠️ « CTT Provision » (barre claire) n'est **pas** un supplément de marge : c'est un "
+               "avantage de **trésorerie** repris à la régularisation progressive. La marge CTT réelle "
+               "est le **Mensualisé**. La décision se joue entre **CDII** et **CTT (Mensualisé)**.")
 
     # Totaux globaux par statut
     totaux = df_graph.groupby("Statut")["Marge (€)"].sum()
     c1, c2, c3 = st.columns(3)
-    for col, statut in zip((c1, c2, c3), ["CTT (Provision)", "CTT (Mensualisé)", "CDII"]):
-        col.metric(f"Total {statut}", f"{totaux.get(statut, 0):,.0f} €".replace(",", " "))
+    _labels_totaux = [("CTT (Mensualisé)", "Total CTT réel (Mensualisé)"),
+                      ("CDII", "Total CDII"),
+                      ("CTT Provision (trésorerie)", "Provision (trésorerie, pour info)")]
+    for col, (statut, titre) in zip((c1, c2, c3), _labels_totaux):
+        col.metric(titre, f"{totaux.get(statut, 0):,.0f} €".replace(",", " "))
 
-    st.subheader("🧭 Recommandations par intérimaire")
+    st.subheader("🧭 Quel contrat choisir, et pourquoi")
+
+    with st.expander("🎓 Pourquoi (et quand) le CDII est-il le plus rentable ?", expanded=True):
+        st.markdown(
+            "**Le CTT Provisionné n'est pas un choix de marge.** Séquestrer les IFM/CP baisse "
+            "le brut soumis et gonfle le RGDU les premiers mois, mais la **régularisation "
+            "progressive** (obligatoire, mensuelle sur le cumul) reprend ce sur-allègement au "
+            "mois où le séquestre est versé. Sur la mission, la marge du Provisionné = celle du "
+            "**Mensualisé** ; seule la **trésorerie** diffère. Le vrai arbitrage se joue donc "
+            "entre **CDII** et **CTT**.\n\n"
+            "**Le CDII gagne quand deux conditions sont réunies :**\n"
+            "1. **Peu ou pas d'intermission** — le CDII oblige à payer le salarié entre les "
+            "missions (garantie de rémunération). Placé en continu, ce coût est nul et le CDII "
+            "économise l'IFM (10 % du brut + charges) que le CTT verse en fin de mission.\n"
+            "2. **Formation documentée** — la contribution FSPI/AKTO (≈ 10 % du brut) est "
+            "**récupérable** si elle est consommée en formation. Non documentée, elle est perdue. "
+            "Bien documentée, elle bascule d'un coût à un investissement et fait décoller la marge CDII."
+        )
+
     reco_rows = []
     for r in master_results:
-        best, delta, signal = recommander_statut(r["Marges"])
+        a = analyser_choix_contrat(r, fspi_pct, formation_pct, cout_intermission)
         reco_rows.append({
             "Intérimaire": r["Interimaire"],
-            "Contrat optimal": best,
-            "Marge optimale (€)": r["Marges"][best],
-            "Δ Mensualisation IFM/CP (€)": round(delta, 2),
-            "Décision IFM/CP": "Intégrer" if delta > 0 else "Séquestrer",
+            "Contrat recommandé": "🟢 CDII" if a["recommande"] == "CDII" else "🔵 CTT",
+            "Marge CDII nette (€)": a["cdii_net"],
+            "Marge CTT réelle (€)": a["ctt_reel"],
+            "Écart CDII − CTT (€)": a["delta"],
+            "Levier formation (€/mois)": a["levier_formation"],
         })
     st.dataframe(pd.DataFrame(reco_rows), use_container_width=True, hide_index=True)
-    st.caption("💡 « Δ Mensualisation » = marge CTT Mensualisé − marge CTT Provision. "
-               "Positif → intégrer les IFM/CP en cours de mois est gagnant ; "
-               "négatif → mieux vaut les laisser en séquestre tant que la mission n'est pas soldée.")
-    st.caption(f"🎓 Le CDII intègre la contribution FSPI/AKTO ({fspi_pct:.0f} % du brut, équivalent IFM "
-               "affecté au fonds formation, accord de branche du 10/07/2013). Réglage actuel : "
-               f"{formation_pct:.0f} % récupéré par la formation. Le CDII n'est réellement rentable "
-               "que si vous consommez cette contribution en formant vos intérimaires — sinon elle "
-               "est perdue. Ajustez le curseur « Part récupérée par la formation » pour voir le seuil.")
+    st.caption("« Marge CTT réelle » = Mensualisé (= Provisionné après régularisation). "
+               "« Écart » positif → CDII plus rentable. « Levier formation » = FSPI encore "
+               "perdue, récupérable en documentant la formation interne.")
+
+    # Message de synthèse global sur la formation (le gisement de marge)
+    _levier_total = sum(a_["levier_formation"] for a_ in
+                        (analyser_choix_contrat(r, fspi_pct, formation_pct, cout_intermission)
+                         for r in master_results))
+    if _levier_total > 0.5:
+        st.warning(f"⚡ **Gisement de marge identifié : {_levier_total:,.0f} €/mois** de FSPI "
+                   f"actuellement perdue sur ce lot ({12 * _levier_total:,.0f} €/an), récupérable "
+                   "en **référençant vos formations internes existantes**. C'est le premier levier "
+                   "à activer avant tout choix de contrat.".replace(",", " "))
 
     # Synthèse des anomalies de coefficient de facturation
     anomalies_coef = [(nom, c) for nom, c in controles_coef.items() if c["alertes"]]
@@ -1290,11 +1362,12 @@ if "dossiers_audit" in st.session_state:
             badge = "⚠️ COEF ANORMAL"
         else:
             badge = ""
-        best, delta, signal = recommander_statut(r["Marges"])
+        analyse = analyser_choix_contrat(r, fspi_pct, formation_pct, cout_intermission)
+        best = "CDII" if analyse["recommande"] == "CDII" else "CTT (Mensualisé)"
 
         with st.expander(
             f"Dossier : {r['Interimaire']} | Coef : {r['Coef']} | Heures : {r['Heures']}h "
-            f"| Optimal : {best} {badge}",
+            f"| Recommandé : {best} {badge}",
             expanded=True,
         ):
             if brut0 and not trouve:
@@ -1338,7 +1411,25 @@ if "dossiers_audit" in st.session_state:
                 else:
                     st.success(f"✅ Coefficient commercial validé : {_cc:.2f} "
                                "(main-d'œuvre facturée au bon taux).")
-                st.info(signal)
+                # --- RECOMMANDATION DE CONTRAT (le cœur de la décision) ---
+                if analyse["recommande"] == "CDII":
+                    msg = (f"🟢 **CDII recommandé** : marge {analyse['cdii_net']:.0f} € "
+                           f"vs {analyse['ctt_reel']:.0f} € en CTT (**{analyse['delta']:+.0f} €/mois**).")
+                    if analyse["raisons"]:
+                        msg += " Pourquoi : " + " ; ".join(analyse["raisons"]) + "."
+                    st.success(msg)
+                    if analyse["levier_formation"] > 0.5:
+                        st.info(f"⚡ Levier : documenter la formation interne récupérerait jusqu'à "
+                                f"**+{analyse['levier_formation']:.0f} €/mois** de FSPI aujourd'hui perdue.")
+                else:
+                    msg = (f"🔵 **CTT recommandé** : marge {analyse['ctt_reel']:.0f} € "
+                           f"vs {analyse['cdii_net']:.0f} € en CDII ({analyse['delta']:+.0f} €/mois).")
+                    if analyse["raisons"]:
+                        msg += " Pourquoi : " + " ; ".join(analyse["raisons"]) + "."
+                    st.warning(msg)
+                st.caption(f"ℹ️ Le CTT **Provisionné** afficherait {analyse['delta_tresorerie']:+.0f} €/mois "
+                           "de plus, mais c'est un gain de **trésorerie** repris à la régularisation "
+                           "progressive — même marge réelle que le Mensualisé. Il n'entre pas dans l'arbitrage.")
 
             # --- CONTRÔLE DES COEFFICIENTS DE FACTURATION (réconciliation BS vs Facture) ---
             ctrl = controles_coef.get(r["Interimaire"])
