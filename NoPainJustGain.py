@@ -223,6 +223,45 @@ def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
             if retenue:
                 consolidation[interimaire]["total"] += montant
 
+# Factures « hors main-d'œuvre » (prestation de management, forfait encadrement…) :
+# elles n'ont AUCUN intérimaire rattaché, donc aucun coût de paie en face. Ce sont des
+# revenus à part entière qu'il faut compter dans la marge globale de l'agence.
+_RE_PRESTA_FORFAIT = re.compile(
+    r"management\s+op[ée]rationnel|prestation\s+de\s+management|"
+    r"encadrement\s+et\s+planification", re.I)
+
+def lire_prestations_hors_mo(fichiers_factures, mois_cible=None):
+    """
+    Repère les factures sans intérimaire (management/forfait) et renvoie la liste
+    {numero, periode, libelle, montant_ht, fichier}. Ces montants sont de la marge
+    quasi pure : ils n'ont pas de bulletin en face.
+    """
+    presta = []
+    for fichier in fichiers_factures:
+        with pdfplumber.open(fichier) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text() or ""
+                if not _RE_PRESTA_FORFAIT.search(t):
+                    continue
+                num = re.search(r"FACTURE\s+N°\s*(\d+)", t, re.I)
+                per = re.search(r"Période du (\d{2}/\d{2}/\d{4}) au (\d{2}/\d{2}/\d{4})", t)
+                # Mois de la prestation = mois de la date de FIN de période
+                mois_presta = per.group(2)[3:5] if per else None
+                if mois_cible and mois_presta and mois_presta != mois_cible:
+                    continue
+                mth = re.search(r"Total HT\s*(?:\n|.)*?(\d[\d\u00a0 ]*,\d{2})", t)
+                montant = parse_montant_fr(mth.group(1)) if mth else 0.0
+                lib = "Prestation de management opérationnel"
+                sems = re.search(r"((?:S\d{2}\s*-?\s*)+)", t)
+                presta.append({
+                    "numero": num.group(1) if num else "?",
+                    "periode": f"{per.group(1)}→{per.group(2)}" if per else "?",
+                    "semaines": sems.group(1).strip() if sems else "",
+                    "libelle": lib, "montant_ht": round(montant, 2),
+                    "fichier": fichier.name, "mois": mois_presta,
+                })
+    return presta
+
 def lire_factures_bestt_consolidees(fichiers_factures, mois_cible="05"):
     consolidation = {}
     for fichier in fichiers_factures:
@@ -664,6 +703,61 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
             }
         resultats.append({"facture": fact, "bs": bs_data})
     return resultats
+
+def nom_du_bs(texte):
+    """
+    Nom du salarié. Sur ce format, il figure sur la ligne d'en-tête juste AVANT le
+    n° de sécurité sociale (« … ANTIPOLIS BIRNAZ Marian 1760499151 1 »), puis seul
+    sur la ligne suivante, au-dessus de l'adresse.
+    """
+    for ligne in texte.split("\n"):
+        m = re.search(r"([A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,3})\s+(\d{9,15})\s+\d+\s*$",
+                      ligne.strip())
+        if m:
+            nom = re.sub(r"\s+", " ", m.group(1)).strip()
+            nom = re.sub(r"^(?:.*ANTIPOLIS|.*INTERIM)\s+", "", nom).strip()
+            if len(nom) > 3 and not re.search(r"TALENTIS|AREP|SOPHIA|Sécurité", nom, re.I):
+                return nom
+    # Repli : ligne seule suivie d'une adresse commençant par un numéro
+    m = re.search(r"\n([A-ZÀ-Ý][A-Za-zÀ-ÿ'\- ]{3,40})\n\s*\d+\s*(?:BD|BOULEVARD|Boulevard|[Rr]ue|RUE|"
+                  r"[Aa]v|Avenue|CHEMIN|[Cc]hemin)", texte)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return None
+
+def detecter_bs_non_factures(fichiers_bs, factures_data):
+    """
+    Repère les BULLETINS du mois qui n'ont AUCUNE facturation retenue en face :
+    intérimaire payé mais (semble-t-il) pas facturé au client. C'est soit une
+    facturation manquante dans le lot déposé, soit un vrai oubli de facturation
+    — dans les deux cas, un point d'audit à vérifier.
+    Renvoie une liste {nom, brut_sb, heures, fichier}.
+    """
+    docs = _lire_bs(fichiers_bs)
+
+    def _cle(n):
+        return re.sub(r"[^A-Z]", "", (n or "").upper())
+
+    cles_fact = {_cle(f["interimaire"]) for f in factures_data}
+    orphelins, vus = [], set()
+    for d in docs:
+        nom = nom_du_bs(d["texte"])
+        if not nom:
+            continue
+        k = _cle(nom)
+        if not k or k in vus:
+            continue
+        vus.add(k)
+        # Rapprochement souple : nom du BS contenu dans un nom facturé, ou l'inverse
+        if any(k in kf or kf in k for kf in cles_fact if kf):
+            continue
+        sb, base, _m, _l, rows = extraire_brut(d["texte"], d["mots"])
+        heures = extraire_heures(d["texte"], rows)
+        orphelins.append({
+            "nom": nom, "brut_sb": round(sb, 2) if sb else 0.0,
+            "heures": heures, "fichier": d.get("name", ""),
+        })
+    return orphelins
 
 # ==========================================
 # 5. MOTEUR DE CALCUL MÉTIER
@@ -1118,6 +1212,8 @@ if st.button("Lancer l'Audit Automatique", type="primary"):
             mois_effectif = mois_bs_lot or mois_cible
             factures_consolidees = lire_factures_bestt_consolidees(fichiers_factures, mois_cible=mois_effectif)
             dossiers_complets = extraire_et_associer_bs(fichiers_bs, factures_consolidees)
+            bs_non_factures = detecter_bs_non_factures(fichiers_bs, factures_consolidees)
+            prestations_hors_mo = lire_prestations_hors_mo(fichiers_factures, mois_cible=mois_effectif)
 
         if mois_bs_lot and mois_bs_lot != mois_cible:
             st.info(f"📅 Mois détecté sur les bulletins : **{MOIS_LABELS[mois_bs_lot]}**. "
@@ -1135,6 +1231,8 @@ if st.button("Lancer l'Audit Automatique", type="primary"):
         st.session_state["dossiers_audit"] = dossiers_complets
         st.session_state["mois_audit"] = mois_effectif
         st.session_state["annee_audit"] = annee_cible
+        st.session_state["bs_non_factures"] = bs_non_factures
+        st.session_state["prestations_hors_mo"] = prestations_hors_mo
         for k in [k for k in st.session_state.keys() if k.startswith("brut_")]:
             del st.session_state[k]
 
@@ -1354,6 +1452,32 @@ if "dossiers_audit" in st.session_state:
         st.caption((f"✅ Couverture facturation / bulletins : {couv_lot * 100:.0f} % "
                     f"({_h_fact:,.0f} h facturées pour {_h_bs:,.0f} h au bulletin — semaines {_sem_lot}).")
                    .replace(",", " "))
+
+    # --- BULLETINS PAYÉS SANS FACTURATION (risque de non-facturation) ---
+    _orph = st.session_state.get("bs_non_factures", [])
+    if _orph:
+        _tot_orph = sum(o["brut_sb"] for o in _orph)
+        st.error((f"🚨 **{len(_orph)} intérimaire(s) payé(s) mais NON facturé(s) sur "
+                  f"{MOIS_LABELS[mois_audit]}** — {_tot_orph:,.0f} € de brut sans facturation en face. "
+                  "Soit la facture correspondante manque dans le lot déposé, soit c'est un **oubli de "
+                  "facturation** : à vérifier en priorité, c'est de la marge perdue.").replace(",", " "))
+        st.dataframe(pd.DataFrame([
+            {"Intérimaire": o["nom"], "Brut social (€)": o["brut_sb"], "Heures": o["heures"]}
+            for o in _orph]), use_container_width=True, hide_index=True)
+
+    # --- PRESTATIONS HORS MAIN-D'ŒUVRE (management, encadrement) ---
+    _presta = st.session_state.get("prestations_hors_mo", [])
+    if _presta:
+        _tot_presta = sum(p["montant_ht"] for p in _presta)
+        st.success((f"💰 **{_tot_presta:,.0f} € HT de prestations hors main-d'œuvre** "
+                    f"(management / encadrement) facturées sur {MOIS_LABELS[mois_audit]}. "
+                    "Sans bulletin en face, c'est de la **marge quasi pure** — elle n'est pas incluse "
+                    "dans les marges par intérimaire ci-dessous, à ajouter à la marge globale du client.")
+                   .replace(",", " "))
+        st.dataframe(pd.DataFrame([
+            {"Facture": p["numero"], "Période": p["periode"], "Semaines": p["semaines"],
+             "Montant HT (€)": p["montant_ht"]} for p in _presta]),
+            use_container_width=True, hide_index=True)
 
     # --- ALERTE COUVERTURE : factures incomplètes vs période des bulletins ---
     _couv = [(r["Interimaire"], r["Couverture"]) for r in master_results
