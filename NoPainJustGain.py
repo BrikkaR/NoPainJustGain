@@ -581,6 +581,16 @@ def _trouver_page_bs(docs, nom_facture):
             continue
         correspondances.append(d)
 
+    # Bulletins sur PLUSIEURS pages (ex. lignes « Rappel mission ») : les pages de
+    # continuation portent le nom mais AUCUN récapitulatif « TOTAUX … SB » — elles
+    # peuvent toutefois exposer un faux brut (acomptes, cumuls annuels). On ne doit pas
+    # les confondre avec de vrais homonymes : on ne garde que la page portant le récap'.
+    if len(correspondances) > 1:
+        avec_recap = [d for d in correspondances
+                      if re.search(r"TOTAUX\s*:", d["texte"])]
+        if len(avec_recap) == 1:
+            correspondances = avec_recap
+
     if len(correspondances) == 1:
         return correspondances[0], "ok"
     if len(correspondances) == 0:
@@ -715,6 +725,20 @@ def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
     cout_total_cdii = brut_cdii + bs["primes_non_soumises"] + charges_nettes_cdii + fspi_cdii
     marge_cdii = facture - cout_total_cdii
 
+    # --- CONTRÔLE DE COUVERTURE : heures FACTURÉES vs heures du BULLETIN ---
+    # Les factures sont hebdomadaires : si le lot déposé ne couvre pas tout le mois du BS
+    # (semaines de fin de mois facturées plus tard, facture manquante), la facturation est
+    # amputée et les marges plongent artificiellement. On mesure le taux de couverture.
+    # ⚠️ On ne compte QUE les heures réellement travaillées : les lignes de MAJORATION
+    # (« MAJ HEURES SUP 25% » facturée au seul différentiel) ne sont pas des heures, et les
+    # HEURES DE PAUSE ne figurent pas dans le total d'heures du bulletin.
+    heures_facturees = round(sum(
+        (l.get("qte") or 0.0) for l in lignes_facture
+        if l.get("retenue") and not re.search(r"\bMAJ\b|MAJORATION|PAUSE",
+                                              str(l.get("ligne", "")), re.I)), 2)
+    heures_bs = bs.get("heures_total") or 0.0
+    couverture = round(heures_facturees / heures_bs, 4) if heures_bs > 0 else None
+
     return {
         "Interimaire": nom,
         "Heures": round(bs.get("heures_total", heures_ref_rgdu), 2),
@@ -725,6 +749,8 @@ def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
         "BrutSB": brut_sb,
         "BrutTrouve": bs.get("brut_trouve", brut_base > 0),
         "TauxCharges": round(tx, 4),
+        "HeuresFacturees": heures_facturees,
+        "Couverture": couverture,
         "ChargesTrouve": bs.get("charges_trouve", False),
         "FichierBS": bs.get("fichier_bs"),
         "LabelBrut": bs.get("label_brut"),
@@ -796,6 +822,56 @@ def analyser_choix_contrat(r, fspi_pct=10.0, formation_pct=0.0, cout_intermissio
         "economie_ifm": round(economie_ifm, 2), "fspi_plein": round(fspi_plein, 2),
         "fspi_perdue": round(fspi_perdue, 2), "levier_formation": round(levier, 2),
         "delta_tresorerie": delta_tresorerie, "raisons": raisons,
+    }
+
+def controle_couverture(dossier):
+    """
+    Vérifie que la FACTURATION retenue couvre bien TOUT le mois du bulletin.
+
+    Cas typique détecté : les factures sont hebdomadaires et le lot déposé s'arrête
+    avant la fin du mois (dernières semaines pas encore facturées / PDF incomplet).
+    Le brut du BS porte alors sur le mois entier alors que la facture n'en couvre
+    qu'une partie -> marges artificiellement basses, voire négatives.
+
+    Compare les HEURES facturées (lignes d'heures retenues, hors lignes de simple
+    MAJORATION qui ne rajoutent pas d'heures) aux heures du bulletin.
+    Renvoie un dict de diagnostic.
+    """
+    f = dossier["facture"]
+    heures_bs = dossier["bs"].get("heures_total") or 0.0
+    heures_fact = 0.0
+    semaines = set()
+    for l in f.get("lignes_retenues", []):
+        if not l.get("retenue"):
+            continue
+        s = re.search(r"Sem\.?\s*(\d+)", l.get("ligne", ""))
+        if s:
+            semaines.add(int(s.group(1)))
+        lib = (l.get("libelle") or "").upper()
+        # Lignes d'heures réelles : on exclut les majorations (« MAJ … », « Majoration … »),
+        # dont la quantité fait doublon avec les heures déjà comptées, et les primes.
+        if "HEURE" in lib and not lib.startswith("MAJ") and "MAJORATION" not in lib:
+            if l.get("qte"):
+                heures_fact += l["qte"]
+    couverture = (heures_fact / heures_bs) if heures_bs > 0 else None
+    # Trois niveaux : ≥95 % complet ; 85-95 % résidu normal de bord de mois (la dernière
+    # semaine à cheval est facturée le mois suivant) ; <85 % semaines entières manquantes.
+    if couverture is None:
+        niveau = "inconnu"
+    elif couverture >= 0.95:
+        niveau = "complet"
+    elif couverture >= 0.85:
+        niveau = "bord_de_mois"
+    else:
+        niveau = "incomplet"
+    return {
+        "heures_facturees": round(heures_fact, 2),
+        "heures_bs": round(heures_bs, 2),
+        "heures_manquantes": round(max(0.0, heures_bs - heures_fact), 2),
+        "couverture": couverture,
+        "semaines": sorted(semaines),
+        "niveau": niveau,
+        "complet": niveau in ("complet", "inconnu"),
     }
 
 def controle_coefficients(dossier, tolerance=0.02):
@@ -1246,6 +1322,81 @@ if "dossiers_audit" in st.session_state:
     # ----------------------------------------------------------
     st.header("📊 Synthèse : choix du contrat optimal")
 
+    # --- CONTRÔLE DE COUVERTURE : la facturation couvre-t-elle tout le mois du BS ? ---
+    couvertures = {d["facture"]["interimaire"]: controle_couverture(d) for d in dossiers}
+    _h_fact = sum(c["heures_facturees"] for c in couvertures.values())
+    _h_bs = sum(c["heures_bs"] for c in couvertures.values())
+    couv_lot = (_h_fact / _h_bs) if _h_bs > 0 else None
+    _sem_lot = sorted({s for c in couvertures.values() for s in c["semaines"]})
+    _fact_lue = sum(d["facture"]["total_facture"] for d in dossiers)
+
+    if couv_lot is not None and 0 < couv_lot < 0.85:
+        _manque = _fact_lue * (1 / couv_lot - 1)
+        st.error(
+            (f"⛔ **Facturation incomplète : {couv_lot * 100:.0f} % du mois seulement.** "
+             f"Les factures déposées couvrent **{_h_fact:,.0f} h** contre **{_h_bs:,.0f} h** aux "
+             f"bulletins (semaines facturées : {_sem_lot}). Le brut porte sur le mois entier, "
+             f"la facturation non → **les marges ci-dessous sont sous-estimées d'environ "
+             f"{_manque:,.0f} €** et peuvent apparaître négatives à tort. "
+             "👉 Ajoutez les factures des semaines de fin de mois, puis relancez l'audit.")
+            .replace(",", " "))
+        st.info((f"📐 À couverture complète, la facturation du mois serait d'environ "
+                 f"**{_fact_lue / couv_lot:,.0f} €** au lieu des {_fact_lue:,.0f} € lus. "
+                 "Une marge « estimée » est affichée par dossier (indicatif, à confirmer "
+                 "avec les factures réelles).").replace(",", " "))
+    elif couv_lot is not None and couv_lot < 0.95:
+        st.warning((f"⚠️ Couverture {couv_lot * 100:.0f} % ({_h_fact:,.0f} h facturées / "
+                    f"{_h_bs:,.0f} h au bulletin, semaines {_sem_lot}). Écart habituel de "
+                    "**bord de mois** : la semaine à cheval sur la fin du mois est facturée le mois "
+                    "suivant. Les marges sont donc légèrement prudentes (sous-estimées).")
+                   .replace(",", " "))
+    elif couv_lot is not None:
+        st.caption((f"✅ Couverture facturation / bulletins : {couv_lot * 100:.0f} % "
+                    f"({_h_fact:,.0f} h facturées pour {_h_bs:,.0f} h au bulletin — semaines {_sem_lot}).")
+                   .replace(",", " "))
+
+    # --- ALERTE COUVERTURE : factures incomplètes vs période des bulletins ---
+    _couv = [(r["Interimaire"], r["Couverture"]) for r in master_results
+             if r.get("Couverture") is not None]
+    _incomplets = [(n, c) for n, c in _couv if c < 0.95]
+    if _incomplets:
+        _moy = sum(c for _, c in _couv) / len(_couv)
+        _hf = sum(r["HeuresFacturees"] for r in master_results)
+        _hb = sum(r["Heures"] for r in master_results)
+        _fact_tot = sum(r["Data"]["CTT (Mensualisé)"][0] for r in master_results)
+        _marge_tot = sum(r["Marges"]["CTT (Mensualisé)"] for r in master_results)
+        _extrap = sum(r["Marges"]["CTT (Mensualisé)"]
+                      + r["Data"]["CTT (Mensualisé)"][0] * (1 / r["Couverture"] - 1)
+                      for r in master_results if r.get("Couverture"))
+        st.error(
+            f"⛔ **Facturation incomplète — les marges affichées sont FAUSSÉES.** "
+            f"{len(_incomplets)} dossier(s) sur {len(_couv)} ont moins de 95 % de leurs heures "
+            f"facturées. Total : **{_hf:,.0f} h facturées contre {_hb:,.0f} h payées** "
+            f"(couverture moyenne **{_moy * 100:.0f} %**). "
+            "Cause habituelle : les factures sont **hebdomadaires** et le lot déposé ne couvre pas "
+            "toutes les semaines du mois du bulletin (les dernières semaines sont facturées le mois "
+            "suivant). Déposez **toutes les factures** couvrant la période des bulletins, puis relancez."
+            .replace(",", " "))
+        cA, cB = st.columns(2)
+        cA.metric("Marge affichée (facturation partielle)",
+                  f"{_marge_tot:,.0f} €".replace(",", " "))
+        cB.metric("Marge estimée à couverture 100 %",
+                  f"{_extrap:,.0f} €".replace(",", " "),
+                  help="Extrapolation INDICATIVE : facturation ramenée au prorata des heures "
+                       "réellement payées. À confirmer en déposant les factures manquantes.")
+        with st.expander("📋 Voir la couverture par intérimaire"):
+            st.dataframe(pd.DataFrame(
+                [{"Intérimaire": r["Interimaire"],
+                  "Heures facturées": r["HeuresFacturees"],
+                  "Heures payées (BS)": r["Heures"],
+                  "Couverture": f"{r['Couverture'] * 100:.0f} %"
+                  if r.get("Couverture") is not None else "—"}
+                 for r in master_results]), use_container_width=True, hide_index=True)
+    elif _couv:
+        st.success(f"✅ Couverture facturation/bulletins complète "
+                   f"({min(c for _, c in _couv) * 100:.0f} % minimum). Marges exploitables.")
+
+
     rows = []
     for r in master_results:
         for statut, marge in r["Marges"].items():
@@ -1411,6 +1562,28 @@ if "dossiers_audit" in st.session_state:
                 else:
                     st.success(f"✅ Coefficient commercial validé : {_cc:.2f} "
                                "(main-d'œuvre facturée au bon taux).")
+                # --- COUVERTURE DE LA FACTURATION SUR LE MOIS ---
+                _cv = couvertures.get(r["Interimaire"])
+                if _cv and _cv["couverture"] is not None and _cv["niveau"] == "incomplet":
+                    _f = r["Data"]["CTT (Provision)"][0]      # facturation HT retenue
+                    _redress = _f * (1 / _cv["couverture"] - 1)
+                    st.error(
+                        f"⛔ Facturation incomplète : **{_cv['couverture'] * 100:.0f} %** du mois "
+                        f"({_cv['heures_facturees']:.0f} h facturées / {_cv['heures_bs']:.0f} h au "
+                        f"bulletin, semaines {_cv['semaines']} → il manque ~{_cv['heures_manquantes']:.0f} h). "
+                        f"Marges ci-dessous sous-estimées d'environ **{_redress:,.0f} €**. "
+                        f"Marge CTT estimée à couverture complète : "
+                        f"**{analyse['ctt_reel'] + _redress:+,.0f} €** · CDII : "
+                        f"**{analyse['cdii_net'] + _redress:+,.0f} €**.".replace(",", " "))
+                elif _cv and _cv["niveau"] == "bord_de_mois":
+                    st.caption(f"⚠️ Couverture {_cv['couverture'] * 100:.0f} % "
+                               f"({_cv['heures_facturees']:.0f} h / {_cv['heures_bs']:.0f} h, semaines "
+                               f"{_cv['semaines']}) — résidu normal de bord de mois, marge un peu prudente.")
+                elif _cv and _cv["couverture"] is not None:
+                    st.caption(f"✅ Couverture facturation : {_cv['couverture'] * 100:.0f} % "
+                               f"({_cv['heures_facturees']:.0f} h / {_cv['heures_bs']:.0f} h, "
+                               f"semaines {_cv['semaines']}).")
+
                 # --- RECOMMANDATION DE CONTRAT (le cœur de la décision) ---
                 if analyse["recommande"] == "CDII":
                     msg = (f"🟢 **CDII recommandé** : marge {analyse['cdii_net']:.0f} € "
