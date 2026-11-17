@@ -189,7 +189,31 @@ def est_ligne_prestation(ligne):
     """
     return bool(re.search(r"sem\.?\s*\d", ligne, re.IGNORECASE)) and bool(_RE_DATES.search(ligne))
 
-def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
+def extraire_client(texte):
+    """
+    Nom du client sur l'en-tête de facture : la ligne juste AVANT le téléphone Talentis
+    (« 04.22.32.87.80 »). La ville (sur la ligne SIRET du client) sert à distinguer deux
+    établissements de même nom (ex. La Poissonnerie Nice vs Puget).
+    Renvoie une étiquette lisible, ou None.
+    """
+    lignes = texte.split("\n")
+    nom = None
+    for i, l in enumerate(lignes):
+        if "04.22.32.87.80" in l and i > 0:
+            cand = lignes[i - 1].strip()
+            if cand and not re.search(r"SOPHIA|ANTIPOLIS|TALENTIS|AREP|BRUCS|SIRET|TVA", cand, re.I):
+                nom = re.sub(r"\s+", " ", cand).strip()
+            break
+    if not nom:
+        return None
+    # Ville : « 06000 NICE » / « 83480 PUGET-SUR-ARGENS » en fin de ligne SIRET client
+    ville = None
+    mv = re.search(r"FR14978850022\s+\d{5}\s+([A-ZÉÈ][A-Za-zÉÈÀ'\- ]+)", texte)
+    if mv:
+        ville = mv.group(1).strip().title()
+    return f"{nom.title()} ({ville})" if ville else nom.title()
+
+def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation, client=None):
     """Parse les lignes d'une page de facture et alimente `consolidation` (dict mutable)."""
     interimaire = None
     for ligne in lignes:
@@ -199,7 +223,9 @@ def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
         m_nom = _RE_NOM.search(ligne)
         if m_nom and not _RE_DATES.search(ligne):
             interimaire = re.sub(r"\s+", " ", m_nom.group(1)).strip()
-            consolidation.setdefault(interimaire, {"total": 0.0, "historique_lignes": []})
+            entry = consolidation.setdefault(interimaire, {"total": 0.0, "historique_lignes": [], "client": client})
+            if client and not entry.get("client"):
+                entry["client"] = client
             continue
 
         if interimaire and est_ligne_prestation(ligne):
@@ -312,7 +338,9 @@ def lire_factures_bestt_consolidees(fichiers_factures, mois_cible="05"):
         with pdfplumber.open(fichier) as pdf:
             for page in pdf.pages:
                 texte_complet += (page.extract_text() or "") + "\n"
-        parser_lignes_facture(texte_complet.split("\n"), fichier.name, mois_cible, consolidation)
+        client = extraire_client(texte_complet) or fichier.name
+        parser_lignes_facture(texte_complet.split("\n"), fichier.name, mois_cible,
+                              consolidation, client=client)
 
     donnees = []
     for nom, data in consolidation.items():
@@ -320,6 +348,7 @@ def lire_factures_bestt_consolidees(fichiers_factures, mois_cible="05"):
         if nb_retenues > 0:   # au moins une ligne du mois cible (même si total net = 0 -> anomalie)
             donnees.append({
                 "interimaire": nom,
+                "client": data.get("client") or "Client inconnu",
                 "total_facture": round(data["total"], 2),
                 "lignes_retenues": data["historique_lignes"],
             })
@@ -934,6 +963,7 @@ def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
 
     return {
         "Interimaire": nom,
+        "Client": donnees["facture"].get("client", "Client inconnu"),
         "Heures": round(bs.get("heures_total", heures_ref_rgdu), 2),
         "HeuresRefRGDU": round(heures_ref_rgdu, 2),
         "HeuresSupp": round(bs.get("heures_sup", 0.0), 2),
@@ -1655,39 +1685,55 @@ if "dossiers_audit" in st.session_state:
                    f"({min(c for _, c in _couv) * 100:.0f} % minimum). Marges exploitables.")
 
 
-    rows = []
-    for r in master_results:
-        for statut, marge in r["Marges"].items():
-            libelle = "CTT Provision (trésorerie)" if statut == "CTT (Provision)" else statut
-            rows.append({"Intérimaire": r["Interimaire"], "Statut": libelle, "Marge (€)": marge})
-    df_graph = pd.DataFrame(rows)
+    # On ne compare QUE les deux vrais choix : CTT réel (Mensualisé) et CDII.
+    # La Provision (= trésorerie) est retirée des courbes pour alléger la lecture.
+    COULEURS_STATUT = {"CTT (Mensualisé)": "#ff7f0e", "CDII": "#1f77b4"}
+    df_res = pd.DataFrame([{
+        "Client": r.get("Client", "Client inconnu"), "Intérimaire": r["Interimaire"],
+        "CTT (Mensualisé)": r["Marges"]["CTT (Mensualisé)"], "CDII": r["Marges"]["CDII"],
+    } for r in master_results])
 
-    couleurs = {"CTT Provision (trésorerie)": "#c7c7c7", "CTT (Mensualisé)": "#ff7f0e", "CDII": "#1f77b4"}
-    fig = px.bar(
-        df_graph, x="Intérimaire", y="Marge (€)", color="Statut",
-        barmode="group", color_discrete_map=couleurs, text_auto=".0f",
-        title="Marge nette par statut — CTT réel = Mensualisé, arbitrage CDII vs CTT",
-    )
-    fig.update_layout(legend_title_text="Statut", yaxis_title="Marge nette (€)",
-                      xaxis_title="", uniformtext_minsize=8, uniformtext_mode="hide")
-    fig.add_hline(y=0, line_dash="dash", line_color="grey")
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption("⚠️ « CTT Provision » (barre claire) n'est **pas** un supplément de marge : c'est un "
-               "avantage de **trésorerie** repris à la régularisation progressive. La marge CTT réelle "
-               "est le **Mensualisé**. La décision se joue entre **CDII** et **CTT (Mensualisé)**.")
+    # --- COURBE 1 : marge nette PAR CLIENT (vue d'ensemble) ---
+    df_cli = df_res.groupby("Client", as_index=False)[["CTT (Mensualisé)", "CDII"]].sum()
+    df_cli_long = df_cli.melt(id_vars="Client", var_name="Statut", value_name="Marge (€)")
+    fig_cli = px.bar(df_cli_long, x="Client", y="Marge (€)", color="Statut",
+                     barmode="group", color_discrete_map=COULEURS_STATUT, text_auto=".0f",
+                     title="Marge nette par client — CTT réel vs CDII")
+    fig_cli.update_layout(legend_title_text="", yaxis_title="Marge nette (€)", xaxis_title="")
+    fig_cli.add_hline(y=0, line_dash="dash", line_color="grey")
+    st.plotly_chart(fig_cli, use_container_width=True)
 
-    # Totaux globaux par statut
-    totaux = df_graph.groupby("Statut")["Marge (€)"].sum()
+    # Totaux globaux
+    _tot_ctt = df_res["CTT (Mensualisé)"].sum()
+    _tot_cdii = df_res["CDII"].sum()
+    _tot_treso = sum(r.get("TresorerieRGDU", 0.0) for r in master_results)
     c1, c2, c3 = st.columns(3)
-    _labels_totaux = [("CTT (Mensualisé)", "Total CTT réel (Mensualisé)"),
-                      ("CDII", "Total CDII"),
-                      ("CTT Provision (trésorerie)", "Provision (trésorerie, pour info)")]
-    for col, (statut, titre) in zip((c1, c2, c3), _labels_totaux):
-        col.metric(titre, f"{totaux.get(statut, 0):,.0f} €".replace(",", " "))
+    c1.metric("Total CTT réel (Mensualisé)", f"{_tot_ctt:,.0f} €".replace(",", " "))
+    c2.metric("Total CDII", f"{_tot_cdii:,.0f} €".replace(",", " "),
+              delta=f"{_tot_cdii - _tot_ctt:+,.0f} € vs CTT".replace(",", " "))
+    c3.metric("Trésorerie Provision (info)", f"{_tot_treso:,.0f} €".replace(",", " "),
+              help="Gain de trésorerie du provisionnement, repris à la régularisation — pas de la marge.")
+
+    # --- COURBE 2 : marge PAR INTÉRIMAIRE, regroupée PAR CLIENT (sections repliées) ---
+    st.markdown("**Détail des gains par intérimaire, client par client :**")
+    for client in sorted(df_res["Client"].unique()):
+        sub = df_res[df_res["Client"] == client].sort_values("CDII", ascending=False)
+        t_ctt, t_cdii = sub["CTT (Mensualisé)"].sum(), sub["CDII"].sum()
+        titre = (f"👥 {client} — {len(sub)} intérimaire(s) · "
+                 f"CTT {t_ctt:,.0f} € · CDII {t_cdii:,.0f} €").replace(",", " ")
+        with st.expander(titre, expanded=False):
+            long = sub.melt(id_vars=["Intérimaire"], value_vars=["CTT (Mensualisé)", "CDII"],
+                            var_name="Statut", value_name="Marge (€)")
+            figi = px.bar(long, x="Intérimaire", y="Marge (€)", color="Statut",
+                          barmode="group", color_discrete_map=COULEURS_STATUT, text_auto=".0f")
+            figi.update_layout(legend_title_text="", yaxis_title="Marge (€)", xaxis_title="",
+                               margin=dict(t=10))
+            figi.add_hline(y=0, line_dash="dash", line_color="grey")
+            st.plotly_chart(figi, use_container_width=True)
 
     st.subheader("🧭 Quel contrat choisir, et pourquoi")
 
-    with st.expander("🎓 Pourquoi (et quand) le CDII est-il le plus rentable ?", expanded=True):
+    with st.expander("🎓 Pourquoi (et quand) le CDII est-il le plus rentable ?", expanded=False):
         st.markdown(
             "**Le CTT Provisionné n'est pas un choix de marge.** Séquestrer les IFM/CP baisse "
             "le brut soumis et gonfle le RGDU les premiers mois, mais la **régularisation "
@@ -1708,6 +1754,7 @@ if "dossiers_audit" in st.session_state:
     for r in master_results:
         a = analyser_choix_contrat(r, fspi_pct, formation_pct, cout_intermission)
         reco_rows.append({
+            "Client": r.get("Client", "Client inconnu"),
             "Intérimaire": r["Interimaire"],
             "Contrat recommandé": "🔵 CDII" if a["recommande"] == "CDII" else "🟠 CTT",
             "Marge CDII nette (€)": a["cdii_net"],
@@ -1715,7 +1762,8 @@ if "dossiers_audit" in st.session_state:
             "Écart CDII − CTT (€)": a["delta"],
             "Levier formation (€/mois)": a["levier_formation"],
         })
-    st.dataframe(pd.DataFrame(reco_rows), use_container_width=True, hide_index=True)
+    _df_reco = pd.DataFrame(reco_rows).sort_values(["Client", "Intérimaire"]).reset_index(drop=True)
+    st.dataframe(_df_reco, use_container_width=True, hide_index=True)
     st.caption("« Marge CTT réelle » = Mensualisé (= Provisionné après régularisation). "
                "« Écart » positif → CDII plus rentable. « Levier formation » = FSPI encore "
                "perdue, récupérable en documentant la formation interne.")
@@ -1745,6 +1793,7 @@ if "dossiers_audit" in st.session_state:
     # VUE DÉTAILLÉE PAR SALARIÉ
     # ----------------------------------------------------------
     st.header("🔎 Détail par dossier")
+    st.caption("Classé par client, sections repliées — cliquez pour déplier un intérimaire.")
 
     def style_dataframe(row):
         if row.name == "6. MARGE NETTE":
@@ -1760,7 +1809,14 @@ if "dossiers_audit" in st.session_state:
             return ["color: #721c24; font-weight: bold" if w else "color: #155724" for w in is_worst]
         return [""] * len(row)
 
-    for r in master_results:
+    _dossiers_tries = sorted(master_results,
+                             key=lambda x: (x.get("Client", "zzz"), x["Interimaire"]))
+    _client_courant = None
+    for r in _dossiers_tries:
+        _cli = r.get("Client", "Client inconnu")
+        if _cli != _client_courant:
+            st.subheader(f"👥 {_cli}")
+            _client_courant = _cli
         brut0 = r["BrutLu"] == 0.0
         trouve = r.get("BrutTrouve", not brut0)
         if brut0 and not trouve:
@@ -1775,9 +1831,9 @@ if "dossiers_audit" in st.session_state:
         best = "CDII" if analyse["recommande"] == "CDII" else "CTT (Mensualisé)"
 
         with st.expander(
-            f"Dossier : {r['Interimaire']} | Coef : {r['Coef']} | Heures : {r['Heures']}h "
+            f"{r['Interimaire']} | Coef : {r['Coef']} | Heures : {r['Heures']}h "
             f"| Recommandé : {best} {badge}",
-            expanded=True,
+            expanded=False,
         ):
             if brut0 and not trouve:
                 st.error("🔴 Brut introuvable sur ce bulletin : la lecture automatique a échoué. "
