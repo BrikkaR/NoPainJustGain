@@ -213,19 +213,46 @@ def extraire_client(texte):
         ville = mv.group(1).strip().title()
     return f"{nom.title()} ({ville})" if ville else nom.title()
 
+_RE_VILLE_CLIENT = re.compile(r"FR14978850022\s+\d{5}\s+([A-ZÉÈ][A-Za-zÉÈÀ'\- ]+)")
+
 def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation, client=None):
-    """Parse les lignes d'une page de facture et alimente `consolidation` (dict mutable)."""
+    """
+    Parse les lignes d'une page de facture et alimente `consolidation` (dict mutable).
+    IMPORTANT : un même fichier (ou un export groupé) peut contenir PLUSIEURS clients ;
+    le client est donc redétecté à CHAQUE en-tête de facture (ligne avant le téléphone
+    Talentis), avec sa ville, et appliqué aux intérimaires qui suivent.
+    """
     interimaire = None
+    client_courant = client          # client en cours (mis à jour à chaque en-tête)
+    prev_ligne = ""                  # dernière ligne non vide (pour lire le nom client)
     for ligne in lignes:
         if not ligne or not ligne.strip():
+            continue
+
+        # --- Détection d'un NOUVEL en-tête de facture : le nom client précède le tél. ---
+        if "04.22.32.87.80" in ligne:
+            cand = prev_ligne.strip()
+            if cand and not re.search(r"SOPHIA|ANTIPOLIS|TALENTIS|AREP|BRUCS|SIRET|TVA|FACTURE|P[ée]riode",
+                                      cand, re.I):
+                client_courant = re.sub(r"\s+", " ", cand).strip().title()  # ville ajoutée + bas
+            prev_ligne = ligne
+            continue
+        # --- Ville du client (sur la ligne SIRET), à accoler au nom en cours ---
+        mv = _RE_VILLE_CLIENT.search(ligne)
+        if mv and client_courant and "(" not in client_courant:
+            client_courant = f"{client_courant} ({mv.group(1).strip().title()})"
+            prev_ligne = ligne
             continue
 
         m_nom = _RE_NOM.search(ligne)
         if m_nom and not _RE_DATES.search(ligne):
             interimaire = re.sub(r"\s+", " ", m_nom.group(1)).strip()
-            entry = consolidation.setdefault(interimaire, {"total": 0.0, "historique_lignes": [], "client": client})
-            if client and not entry.get("client"):
-                entry["client"] = client
+            entry = consolidation.setdefault(interimaire,
+                                             {"total": 0.0, "historique_lignes": [], "client": client_courant})
+            # On rattache au client de l'en-tête courant (corrige un fichier multi-clients).
+            if client_courant:
+                entry["client"] = client_courant
+            prev_ligne = ligne
             continue
 
         if interimaire and est_ligne_prestation(ligne):
@@ -289,6 +316,8 @@ def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation, client
             if retenue:
                 consolidation[interimaire]["total"] += montant_retenu
 
+        prev_ligne = ligne   # suivi de la dernière ligne (pour repérer le nom client)
+
 # Factures « hors main-d'œuvre » (prestation de management, forfait encadrement…) :
 # elles n'ont AUCUN intérimaire rattaché, donc aucun coût de paie en face. Ce sont des
 # revenus à part entière qu'il faut compter dans la marge globale de l'agence.
@@ -338,9 +367,9 @@ def lire_factures_bestt_consolidees(fichiers_factures, mois_cible="05"):
         with pdfplumber.open(fichier) as pdf:
             for page in pdf.pages:
                 texte_complet += (page.extract_text() or "") + "\n"
-        client = extraire_client(texte_complet) or fichier.name
+        # Le client est détecté EN LIGNE, à chaque en-tête (fichier mono- ou multi-clients).
         parser_lignes_facture(texte_complet.split("\n"), fichier.name, mois_cible,
-                              consolidation, client=client)
+                              consolidation, client=None)
 
     donnees = []
     for nom, data in consolidation.items():
