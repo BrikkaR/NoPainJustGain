@@ -154,6 +154,33 @@ def mois_de_la_ligne(ligne):
     mois_trouves = [mm.zfill(2) for (_jj, mm) in dates]
     return mois_trouves[-1], mois_trouves
 
+_JOURS_MOIS = {1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30,
+               7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
+
+def fractions_mois(ligne):
+    """
+    Pour une semaine à cheval sur deux mois (« Sem.XX (29/06-04/07) »), renvoie la
+    répartition {mois: fraction} au PRORATA DES JOURS CALENDAIRES de la plage.
+    Une semaine dans un seul mois → {mois: 1.0}. Approche : jours du mois de début
+    (jj_fin_mois_debut − jj_debut + 1) vs jours du mois de fin (jj_fin).
+    ⚠️ Approximation : les heures ne sont pas toujours réparties uniformément sur les
+    jours, mais à défaut du détail quotidien c'est la clé la plus juste disponible.
+    """
+    dates = _RE_DATES.findall(ligne)
+    if not dates:
+        return {}
+    (jj_d, mm_d), (jj_f, mm_f) = dates[0], dates[-1]
+    mm_d, mm_f = mm_d.zfill(2), mm_f.zfill(2)
+    if mm_d == mm_f:
+        return {mm_f: 1.0}
+    jd, jf = int(jj_d), int(jj_f)
+    jours_debut = max(0, _JOURS_MOIS.get(int(mm_d), 30) - jd + 1)
+    jours_fin = max(0, jf)
+    total = jours_debut + jours_fin
+    if total <= 0:
+        return {mm_f: 1.0}
+    return {mm_d: round(jours_debut / total, 4), mm_f: round(jours_fin / total, 4)}
+
 def est_ligne_prestation(ligne):
     """
     Ligne de prestation BESTT = repère de semaine 'Sem.NN' + au moins une date.
@@ -193,7 +220,11 @@ def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
                 apres_egal = ligne.rsplit("=", 1)[1]
                 ms_ap = _tous_les_montants(apres_egal)
                 montant = ms_ap[0] if ms_ap else 0.0
-            retenue = (mois_attr == mois_cible) and a_total
+            # Split calendaire : fraction de la semaine qui tombe dans le mois cible.
+            fracs = fractions_mois(ligne)
+            frac = fracs.get(mois_cible, 0.0)
+            a_cheval = len(fracs) > 1
+            retenue = (frac > 1e-9) and a_total
 
             # Métadonnées pour le contrôle des coefficients de facturation.
             libelle = _libelle_facture(ligne)
@@ -208,8 +239,14 @@ def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
                 taux_fact = round(montant / qte, 4)
             soumise = not bool(_RE_NON_SOUMISE.search(libelle))
 
+            # Part effectivement attribuée au mois cible (fraction si semaine à cheval).
+            montant_retenu = round(montant * frac, 3) if montant else 0.0
+            qte_retenue = round(qte * frac, 3) if qte else qte
+
             if not a_total:
                 statut = "ℹ️ non facturée (sans total « = »)"
+            elif retenue and a_cheval:
+                statut = f"✂️ RETENUE au prorata ({frac * 100:.0f} % — semaine à cheval)"
             elif retenue:
                 statut = "✅ RETENUE"
             else:
@@ -217,11 +254,14 @@ def parser_lignes_facture(lignes, nom_fichier, mois_cible, consolidation):
             consolidation[interimaire]["historique_lignes"].append({
                 "fichier": nom_fichier, "ligne": ligne.strip(),
                 "mois_attribution": mois_attr, "mois_trouves": mois_trouves,
-                "montant": montant, "retenue": retenue, "statut": statut,
-                "libelle": libelle, "qte": qte, "taux_fact": taux_fact, "soumise": soumise,
+                "montant": montant, "montant_retenu": montant_retenu,
+                "fraction": round(frac, 4), "a_cheval": a_cheval,
+                "retenue": retenue, "statut": statut, "libelle": libelle,
+                "qte": qte, "qte_retenue": qte_retenue,
+                "taux_fact": taux_fact, "soumise": soumise,
             })
             if retenue:
-                consolidation[interimaire]["total"] += montant
+                consolidation[interimaire]["total"] += montant_retenu
 
 # Factures « hors main-d'œuvre » (prestation de management, forfait encadrement…) :
 # elles n'ont AUCUN intérimaire rattaché, donc aucun coût de paie en face. Ce sont des
@@ -521,11 +561,19 @@ _RE_ALLEGEMENT = re.compile(
     r"RED\.?\s*G[ÉE]N|R[ÉE]DUCTION\s+G[ÉE]N|\bRGDU\b|FILLON|ALL[ÉE]GEMENT", re.I)
 _RE_TEPA_PATRONALE = re.compile(r"D[ÉE]DUCTION\s+PATRONALE", re.I)
 
+# Cotisation AT/MP (accidents du travail) : son taux = le CODE RISQUE du client, très
+# variable en intérim (manutention, transport, froid… = taux élevés). On l'isole pour
+# pouvoir l'afficher et, au besoin, le forcer par client.
+# NB : le libellé est souvent collé au code rubrique (« A22CCIDENTS DU TRAVAIL »),
+# donc on matche sur « …CCIDENT… TRAVAIL », pas sur « ACCIDENT » en début de mot.
+_RE_ATMP = re.compile(r"CCIDENT.{0,8}TRAVAIL|\bAT\s*/?\s*MP\b", re.I)
+
 def extraire_charges_patronales(texte, rows=None):
     """
-    Renvoie (pp_brut, pp_net, allegement_rgdu, tepa_patronale, ligne_pp, lignes_alleg).
+    Renvoie (pp_brut, pp_net, allegement_rgdu, tepa_patronale, ligne_pp, lignes_alleg, atmp).
     pp_brut = PP net + allègement RGDU + déduction patronale TEPA (part patronale AVANT
-    réductions, que l'outil re-simule). (None, …) si la ligne PP est introuvable.
+    réductions, que l'outil re-simule). atmp = montant patronal AT/MP lu (0.0 si absent).
+    (None, …) si la ligne PP est introuvable.
     """
     lignes = rows if rows else texte.split("\n")
 
@@ -545,10 +593,18 @@ def extraire_charges_patronales(texte, rows=None):
         elif _RE_ALLEGEMENT.search(l):                   # allègement RGDU (1 ou 2 lignes)
             allegement += abs(parse_montant_fr(nums[-1])); lignes_alleg.append(l)
 
+    # AT/MP : scanné sur le TEXTE complet (la ligne n'est pas toujours dans `rows`).
+    atmp = 0.0
+    for l in texte.split("\n"):
+        if _RE_ATMP.search(l):
+            nums = re.findall(_MONTANT_FR, l)
+            if nums:
+                atmp += abs(parse_montant_fr(nums[-1]))
+
     if pp_net is None:
-        return None, None, 0.0, 0.0, None, []
+        return None, None, 0.0, 0.0, None, [], 0.0
     pp_brut = pp_net + allegement + tepa_pat
-    return pp_brut, pp_net, allegement, tepa_pat, ligne_pp, lignes_alleg
+    return pp_brut, pp_net, allegement, tepa_pat, ligne_pp, lignes_alleg, atmp
 
 # Mois de la PÉRIODE du bulletin (pour vérifier la cohérence avec le mois cible des factures).
 _RE_PERIODE_BS = re.compile(
@@ -651,7 +707,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
             heures_supp = extraire_heures_supp(doc_cible["texte"])
             heures_normales = max(0.0, round(heures_total - heures_supp, 2))
             taux_bs, taux_variables, cout_panier = extraire_taux_bs(doc_cible["texte"])
-            pp_brut, pp_net, alleg_rgdu, tepa_pat, ligne_pp, lignes_alleg = \
+            pp_brut, pp_net, alleg_rgdu, tepa_pat, ligne_pp, lignes_alleg, atmp = \
                 extraire_charges_patronales(doc_cible["texte"], rows_diag)
             trouve = sb is not None
             ratio_sb_base = (sb / base) if (trouve and base and base > 0) else RATIO_SB_BASE
@@ -663,6 +719,8 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
             else:
                 taux_charges_auto = TAUX_CHARGES_BASE
                 charges_trouve = False
+            # AT/MP (code risque client) isolé : taux = montant AT/MP ÷ SB
+            taux_atmp = round(atmp / sb, 4) if (atmp and sb and sb > 0) else None
             # Indice « source CDII » : pas d'IFM (ratio ≈ 1,00) → la part patronale inclut
             # déjà la contribution FSPI/formation, à ne pas re-compter en simulation.
             source_sans_ifm = trouve and base and base > 0 and abs(ratio_sb_base - 1.0) < 0.02
@@ -685,6 +743,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "pp_brut_bs": pp_brut, "pp_net_bs": pp_net, "allegement_rgdu_bs": alleg_rgdu,
                 "tepa_patronale_bs": tepa_pat, "ligne_pp": ligne_pp, "lignes_alleg_bs": lignes_alleg,
                 "source_sans_ifm": source_sans_ifm, "mois_bs": mois_bs,
+                "atmp_montant": round(atmp, 2), "taux_atmp": taux_atmp,
             }
         else:
             bs_data = {
@@ -700,6 +759,7 @@ def extraire_et_associer_bs(fichiers_bs, factures_data):
                 "pp_brut_bs": None, "pp_net_bs": None, "allegement_rgdu_bs": 0.0,
                 "tepa_patronale_bs": 0.0, "ligne_pp": None, "lignes_alleg_bs": [],
                 "source_sans_ifm": False, "mois_bs": None,
+                "atmp_montant": 0.0, "taux_atmp": None,
             }
         resultats.append({"facture": fact, "bs": bs_data})
     return resultats
@@ -725,20 +785,40 @@ def nom_du_bs(texte):
         return re.sub(r"\s+", " ", m.group(1)).strip()
     return None
 
-def detecter_bs_non_factures(fichiers_bs, factures_data):
+def noms_et_mois_factures(fichiers_factures):
     """
-    Repère les BULLETINS du mois qui n'ont AUCUNE facturation retenue en face :
-    intérimaire payé mais (semble-t-il) pas facturé au client. C'est soit une
-    facturation manquante dans le lot déposé, soit un vrai oubli de facturation
-    — dans les deux cas, un point d'audit à vérifier.
-    Renvoie une liste {nom, brut_sb, heures, fichier}.
+    Tous les intérimaires figurant sur les factures, TOUS MOIS CONFONDUS,
+    avec les mois pour lesquels ils sont facturés : {nom: {"05", "06"}}.
+    Sert à distinguer « jamais facturé » de « facturé sur un autre mois ».
+    """
+    conso = {}
+    for fichier in fichiers_factures:
+        texte = ""
+        with pdfplumber.open(fichier) as pdf:
+            for page in pdf.pages:
+                texte += (page.extract_text() or "") + "\n"
+        parser_lignes_facture(texte.split("\n"), fichier.name, "__aucun__", conso)
+    return {nom: {l["mois_attribution"] for l in d["historique_lignes"] if l["mois_attribution"]}
+            for nom, d in conso.items()}
+
+def detecter_bs_non_factures(fichiers_bs, factures_data, fichiers_factures=None):
+    """
+    Repère les BULLETINS du mois qui n'ont AUCUNE facturation retenue en face,
+    et distingue DEUX situations très différentes :
+      • "jamais_facture"  : le nom n'apparaît sur AUCUNE facture du lot
+                            → vraie alerte, risque d'oubli de facturation ;
+      • "autre_mois"      : le nom est bien facturé, mais sur un autre mois
+                            → la facture du mois audité manque simplement au lot.
+    Renvoie une liste {nom, brut_sb, heures, statut, mois_factures}.
     """
     docs = _lire_bs(fichiers_bs)
+    noms_mois = noms_et_mois_factures(fichiers_factures) if fichiers_factures else {}
 
     def _cle(n):
         return re.sub(r"[^A-Z]", "", (n or "").upper())
 
     cles_fact = {_cle(f["interimaire"]) for f in factures_data}
+    cles_tous = {_cle(n): (n, mois) for n, mois in noms_mois.items()}
     orphelins, vus = [], set()
     for d in docs:
         nom = nom_du_bs(d["texte"])
@@ -748,14 +828,21 @@ def detecter_bs_non_factures(fichiers_bs, factures_data):
         if not k or k in vus:
             continue
         vus.add(k)
-        # Rapprochement souple : nom du BS contenu dans un nom facturé, ou l'inverse
+        # Facturé sur le mois audité -> rien à signaler
         if any(k in kf or kf in k for kf in cles_fact if kf):
             continue
+        # Présent sur les factures, mais sur un autre mois ?
+        mois_ailleurs = set()
+        for kf, (_n, mois) in cles_tous.items():
+            if kf and (k in kf or kf in k):
+                mois_ailleurs |= (mois or set())
+        statut = "autre_mois" if mois_ailleurs else "jamais_facture"
         sb, base, _m, _l, rows = extraire_brut(d["texte"], d["mots"])
         heures = extraire_heures(d["texte"], rows)
         orphelins.append({
             "nom": nom, "brut_sb": round(sb, 2) if sb else 0.0,
             "heures": heures, "fichier": d.get("name", ""),
+            "statut": statut, "mois_factures": sorted(mois_ailleurs),
         })
     return orphelins
 
@@ -763,7 +850,8 @@ def detecter_bs_non_factures(fichiers_bs, factures_data):
 # 5. MOTEUR DE CALCUL MÉTIER
 # ==========================================
 def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
-                        fspi_pct=10.0, formation_pct=0.0, taux_charges=None):
+                        fspi_pct=10.0, formation_pct=0.0, taux_charges=None,
+                        ifm_pct=10.0):
     facture = donnees["facture"]["total_facture"]
     lignes_facture = donnees["facture"]["lignes_retenues"]
     nom = donnees["facture"]["interimaire"]
@@ -772,6 +860,7 @@ def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
     # Taux de charges patronales BRUT (avant allègement) : détecté sur le BS, corrigé
     # à la main, ou repli sur le défaut paramétrable. L'allègement est re-simulé ensuite.
     tx = taux_charges if taux_charges is not None else bs.get("taux_charges_auto", TAUX_CHARGES_BASE)
+    tx_ifm = ifm_pct / 100.0                         # taux IFM/CP (10 % par défaut, paramétrable)
     brut_base = bs["total_brut"]                    # base soumise (= SB / 1,21)
     brut_sb = bs.get("brut_sb", brut_base * RATIO_SB_BASE)  # brut social affiché (inclut IFM/CP)
     coef_detecte = facture / brut_base if brut_base > 0 else 0
@@ -790,25 +879,34 @@ def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
     def alleg(brut_ref, majoration):
         return calcul_allegement(params, smic_ref_mois, brut_ref, majoration)[1]
 
-    # -- CTT PROVISIONNÉ -- (majoration caisse CP appliquée au coefficient)
-    rgdu_prov = alleg(brut_base, maj_iccp)
-    charges_nettes_prov = (brut_base * tx) - rgdu_prov - montant_tepa
-    ifm_prov = brut_base * 0.10
-    cp_prov = (brut_base + ifm_prov) * 0.10
-    sequestre_total_prov = (ifm_prov + cp_prov) * (1 + tx)
-    cout_total_prov = brut_base + bs["primes_non_soumises"] + charges_nettes_prov + sequestre_total_prov
-    marge_prov = facture - cout_total_prov
+    ifm_prov = brut_base * tx_ifm
+    cp_prov = (brut_base + ifm_prov) * tx_ifm
+    brut_mens = brut_base + ifm_prov + cp_prov
 
     # -- CTT MENSUALISÉ -- (IFM/CP intégrés au brut soumis ; majoration caisse CP)
-    brut_mens = brut_base + ifm_prov + cp_prov
+    # C'est le RGDU de référence : il porte sur l'assiette RÉELLE (base + IFM + CP).
     rgdu_mens = alleg(brut_mens, maj_iccp)
     charges_nettes_mens = (brut_mens * tx) - rgdu_mens - montant_tepa
     cout_total_mens = brut_mens + bs["primes_non_soumises"] + charges_nettes_mens
     marge_mens = facture - cout_total_mens
 
+    # -- CTT PROVISIONNÉ -- IFM/CP séquestrés : GAIN DE TRÉSORERIE seulement.
+    # ⚠️ ANTI-REDRESSEMENT : le RGDU calculé en cours de mois sur la base seule
+    # (coefficient plus élevé) est REPRIS par la régularisation progressive obligatoire
+    # (mensuelle, sur le cumul). Sur la mission, l'allègement régularisé = celui du
+    # mensualisé. On retient donc rgdu_mens pour la MARGE (pas de sur-déduction fantôme),
+    # et on n'expose la sur-déduction en cours de mois que comme un écart de TRÉSORERIE.
+    rgdu_prov_brut = alleg(brut_base, maj_iccp)      # ce qui serait déduit AVANT régularisation
+    rgdu_prov = rgdu_mens                            # ce qui RESTE après régularisation (marge réelle)
+    tresorerie_rgdu = round(rgdu_prov_brut - rgdu_prov, 2)  # repris à la régularisation
+    charges_nettes_prov = (brut_base * tx) - rgdu_prov - montant_tepa
+    sequestre_total_prov = (ifm_prov + cp_prov) * (1 + tx)
+    cout_total_prov = brut_base + bs["primes_non_soumises"] + charges_nettes_prov + sequestre_total_prov
+    marge_prov = facture - cout_total_prov           # == marge_mens (régularisation neutralise)
+
     # -- CDII -- (pas d'IFM ; CP PAYÉE et intégrée à l'assiette car non prise en congés ;
     #    surcotisation patronale +3.5% AKTO/FSPI ; PAS de majoration caisse CP)
-    cp_cdii = brut_base * 0.10
+    cp_cdii = brut_base * tx_ifm
     brut_cdii = brut_base + cp_cdii                 # CP versée mensuellement -> soumise à cotisations
     rgdu_cdii = alleg(brut_cdii, 1.0)               # aucune majoration ICCP pour le CDII
     charges_nettes_cdii = (brut_cdii * (tx + TAUX_SURCOTISATION_CDII)) - rgdu_cdii - montant_tepa
@@ -827,7 +925,8 @@ def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
     # (« MAJ HEURES SUP 25% » facturée au seul différentiel) ne sont pas des heures, et les
     # HEURES DE PAUSE ne figurent pas dans le total d'heures du bulletin.
     heures_facturees = round(sum(
-        (l.get("qte") or 0.0) for l in lignes_facture
+        (l.get("qte_retenue") if l.get("qte_retenue") is not None else (l.get("qte") or 0.0))
+        for l in lignes_facture
         if l.get("retenue") and not re.search(r"\bMAJ\b|MAJORATION|PAUSE",
                                               str(l.get("ligne", "")), re.I)), 2)
     heures_bs = bs.get("heures_total") or 0.0
@@ -843,6 +942,7 @@ def calculer_comparatif(donnees, params, maj_iccp=MAJORATION_ICCP,
         "BrutSB": brut_sb,
         "BrutTrouve": bs.get("brut_trouve", brut_base > 0),
         "TauxCharges": round(tx, 4),
+        "TresorerieRGDU": tresorerie_rgdu,   # sur-déduction en cours de mois, reprise à la régul.
         "HeuresFacturees": heures_facturees,
         "Couverture": couverture,
         "ChargesTrouve": bs.get("charges_trouve", False),
@@ -890,7 +990,9 @@ def analyser_choix_contrat(r, fspi_pct=10.0, formation_pct=0.0, cout_intermissio
     economie_ifm = base * 0.10                                   # IFM non versée en CDII
     fspi_plein = base * (fspi_pct / 100.0)                       # contribution FSPI totale
     fspi_perdue = fspi_plein * (1 - formation_pct / 100.0)       # part encore perdue (récupérable)
-    delta_tresorerie = round(r["Marges"]["CTT (Provision)"] - ctt_reel, 2)  # gain mensuel de float
+    # Écart de TRÉSORERIE du provisionnement = sur-déduction RGDU en cours de mois,
+    # reprise à la régularisation (marge identique, cf. moteur).
+    delta_tresorerie = round(r.get("TresorerieRGDU", 0.0), 2)
 
     raisons = []
     if recommande == "CDII":
@@ -945,8 +1047,9 @@ def controle_couverture(dossier):
         # Lignes d'heures réelles : on exclut les majorations (« MAJ … », « Majoration … »),
         # dont la quantité fait doublon avec les heures déjà comptées, et les primes.
         if "HEURE" in lib and not lib.startswith("MAJ") and "MAJORATION" not in lib:
-            if l.get("qte"):
-                heures_fact += l["qte"]
+            q = l.get("qte_retenue") if l.get("qte_retenue") is not None else l.get("qte")
+            if q:
+                heures_fact += q
     couverture = (heures_fact / heures_bs) if heures_bs > 0 else None
     # Trois niveaux : ≥95 % complet ; 85-95 % résidu normal de bord de mois (la dernière
     # semaine à cheval est facturée le mois suivant) ; <85 % semaines entières manquantes.
@@ -1195,6 +1298,13 @@ cout_intermission = st.sidebar.number_input(
          "Coût mensuel moyen estimé par intérimaire. 0 € si vos profils sont placés en continu "
          "(pas d'intermission).")
 
+st.sidebar.header("Prime de précarité (IFM)")
+ifm_pct = st.sidebar.number_input(
+    "Taux IFM / CP (% du brut)", value=10.0, step=0.5, min_value=0.0,
+    help="Indemnité de fin de mission ET congés payés : 10 % par défaut (cas général). "
+         "Certaines branches ou accords fixent un taux conventionnel différent — à ajuster ici "
+         "pour que le coût réel du CTT ne soit pas sous-estimé.")
+
 col1, col2 = st.columns(2)
 with col1:
     fichiers_bs = st.file_uploader("📥 Déposer les Bulletins (PDF)", type=["pdf"], accept_multiple_files=True)
@@ -1212,7 +1322,8 @@ if st.button("Lancer l'Audit Automatique", type="primary"):
             mois_effectif = mois_bs_lot or mois_cible
             factures_consolidees = lire_factures_bestt_consolidees(fichiers_factures, mois_cible=mois_effectif)
             dossiers_complets = extraire_et_associer_bs(fichiers_bs, factures_consolidees)
-            bs_non_factures = detecter_bs_non_factures(fichiers_bs, factures_consolidees)
+            bs_non_factures = detecter_bs_non_factures(fichiers_bs, factures_consolidees,
+                                                       fichiers_factures=fichiers_factures)
             prestations_hors_mo = lire_prestations_hors_mo(fichiers_factures, mois_cible=mois_effectif)
 
         if mois_bs_lot and mois_bs_lot != mois_cible:
@@ -1384,6 +1495,11 @@ if "dossiers_audit" in st.session_state:
             own_tx = float(bs.get("taux_charges_auto"))
             c_src.caption(f"✅ détecté : PP net {ppn:.2f} € + RGDU {rg:.2f} € + TEPA {tp:.2f} € "
                           f"÷ SB → **{own_tx * 100:.2f} %** (brut, avant réductions)")
+            _tx_at = bs.get("taux_atmp")
+            if _tx_at:
+                c_src.caption(f"⚙️ dont **AT/MP {_tx_at * 100:.2f} %** (code risque client) "
+                              f"= {bs.get('atmp_montant', 0):.2f} €. Taux propre au risque du poste "
+                              "(manutention, froid, transport…) — à vérifier s'il change de client.")
             if cdii_src:
                 c_src.caption(f"⚠️ Bulletin **sans IFM (CDII)** — taux propre {own_tx * 100:.2f} % "
                               "gonflé par le FSPI/formation. **Socle CTT du lot appliqué** "
@@ -1410,7 +1526,8 @@ if "dossiers_audit" in st.session_state:
                          "total_brut": sb / ratio}}  # base = SB ÷ ratio réel (1,21, ou 1,10 si IFM/CP seul)
         master_results.append(calculer_comparatif(d_calc, params_regime, maj_iccp=maj_iccp,
                                                   fspi_pct=fspi_pct, formation_pct=formation_pct,
-                                                  taux_charges=taux_charges_effectif[nom]))
+                                                  taux_charges=taux_charges_effectif[nom],
+                                                  ifm_pct=ifm_pct))
 
     # Contrôle des coefficients de facturation (soumises vs non soumises), par intérimaire
     controles_coef = {d["facture"]["interimaire"]: controle_coefficients(d) for d in dossiers}
@@ -1453,17 +1570,34 @@ if "dossiers_audit" in st.session_state:
                     f"({_h_fact:,.0f} h facturées pour {_h_bs:,.0f} h au bulletin — semaines {_sem_lot}).")
                    .replace(",", " "))
 
-    # --- BULLETINS PAYÉS SANS FACTURATION (risque de non-facturation) ---
+    # --- BULLETINS PAYÉS SANS FACTURATION ---
     _orph = st.session_state.get("bs_non_factures", [])
-    if _orph:
-        _tot_orph = sum(o["brut_sb"] for o in _orph)
-        st.error((f"🚨 **{len(_orph)} intérimaire(s) payé(s) mais NON facturé(s) sur "
-                  f"{MOIS_LABELS[mois_audit]}** — {_tot_orph:,.0f} € de brut sans facturation en face. "
-                  "Soit la facture correspondante manque dans le lot déposé, soit c'est un **oubli de "
-                  "facturation** : à vérifier en priorité, c'est de la marge perdue.").replace(",", " "))
+    _jamais = [o for o in _orph if o.get("statut") == "jamais_facture"]
+    _autre = [o for o in _orph if o.get("statut") == "autre_mois"]
+
+    if _jamais:
+        _tot_j = sum(o["brut_sb"] for o in _jamais)
+        st.error((f"🚨 **{len(_jamais)} intérimaire(s) payé(s) et ABSENT(S) de toutes les factures** — "
+                  f"{_tot_j:,.0f} € de brut sans aucune facturation, sur aucun mois. "
+                  "C'est le cas le plus grave : **oubli de facturation probable**. "
+                  "À vérifier en priorité, c'est de la marge définitivement perdue si rien n'est émis.")
+                 .replace(",", " "))
         st.dataframe(pd.DataFrame([
             {"Intérimaire": o["nom"], "Brut social (€)": o["brut_sb"], "Heures": o["heures"]}
-            for o in _orph]), use_container_width=True, hide_index=True)
+            for o in _jamais]), use_container_width=True, hide_index=True)
+
+    if _autre:
+        _tot_a = sum(o["brut_sb"] for o in _autre)
+        st.warning((f"⏳ **{len(_autre)} intérimaire(s) facturé(s), mais pas sur "
+                    f"{MOIS_LABELS[mois_audit]}** ({_tot_a:,.0f} € de brut). Ils figurent bien sur les "
+                    "factures du lot, sur d'autres mois : leur prestation du mois audité est "
+                    "vraisemblablement facturée sur une facture non déposée (fin de mois). "
+                    "Pas d'alerte de facturation, mais la marge du mois est incomplète.")
+                   .replace(",", " "))
+        st.dataframe(pd.DataFrame([
+            {"Intérimaire": o["nom"], "Brut social (€)": o["brut_sb"], "Heures": o["heures"],
+             "Facturé sur les mois": ", ".join(MOIS_LABELS.get(mm, mm) for mm in o["mois_factures"])}
+            for o in _autre]), use_container_width=True, hide_index=True)
 
     # --- PRESTATIONS HORS MAIN-D'ŒUVRE (management, encadrement) ---
     _presta = st.session_state.get("prestations_hors_mo", [])
